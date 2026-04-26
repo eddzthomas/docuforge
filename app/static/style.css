@@ -544,6 +544,56 @@ header p {
     transform: rotate(90deg);
 }
 
+/* ---- Upload Options ---- */
+.option-row {
+    display: block;
+    padding: 4px 0;
+    font-size: 0.85rem;
+    cursor: pointer;
+    color: var(--text-secondary);
+}
+
+.option-row input {
+    margin-right: 6px;
+    cursor: pointer;
+}
+
+/* ---- Watcher Path ---- */
+.watcher-path {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-left: 4px;
+}
+
+/* ---- PDF Viewer Modal ---- */
+.pdf-viewer-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    background: var(--bg-primary);
+}
+
+.pdf-viewer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    height: 50px;
+}
+
+.pdf-viewer-header span {
+    font-size: 0.9rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    margin-right: 12px;
+}
+
 /* ---- Status Bar ---- */
 .status-bar {
     display: flex;

@@ -42,6 +42,19 @@
         <!-- List of files queued for upload -->
         <div class="file-list" id="file-list"></div>
 
+        <!-- Bulk options — shown when files are added -->
+        <div id="upload-options" style="display:none; margin-top:12px;">
+            <label class="option-row">
+                <input type="checkbox" id="select-all-chk" onchange="toggleSelectAll()"><strong> Apply to all files in batch</strong>
+            </label>
+            <label class="option-row" style="margin-left:24px;">
+                <input type="checkbox" id="skip-rename-chk" checked> Auto-rename (LLM suggests filename)
+            </label>
+            <label class="option-row" style="margin-left:24px;">
+                <input type="checkbox" id="skip-tags-chk" checked> Auto-tag (LLM suggests up to 5 tags)
+            </label>
+        </div>
+
         <!-- Process button (hidden until files are added) -->
         <button class="btn btn-primary process-btn" id="process-btn" style="display: none;">
             Process Files
@@ -56,6 +69,7 @@
                     <span class="toggle-slider"></span>
                 </label>
                 <span class="watcher-status" id="watcher-status-text">Off</span>
+                <code class="watcher-path" id="watcher-path"></code>
                 <span class="watcher-count" id="watcher-count" style="display:none;"></span>
             </div>
         </div>
@@ -72,6 +86,8 @@
          Job history table with statuses, tags, and download links
          ============================================================ -->
     <div class="tab-panel" id="panel-history">
+        <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:12px;" id="output-path-display"></div>
+
         <!-- Tag filter bar — filters jobs by tag name -->
         <div id="tag-filter" style="margin-bottom:16px;">
             <input type="text" id="tag-search" class="tag-search" placeholder="Filter by tag..." style="width:100%;">
@@ -182,6 +198,18 @@
         </div>
     </div>
 
+    <!-- ---- PDF Viewer Modal (full-screen) ---- -->
+    <div class="pdf-viewer-overlay" id="pdf-viewer-overlay" style="display:none;">
+        <div class="pdf-viewer-header">
+            <span id="pdf-viewer-title">Document</span>
+            <div>
+                <a class="btn btn-sm btn-primary" id="pdf-viewer-download" href="#" download>Download</a>
+                <button class="btn btn-sm" onclick="closePdfViewer()">Close</button>
+            </div>
+        </div>
+        <iframe id="pdf-viewer-iframe" src="" style="width:100%; height:calc(100% - 50px); border:none;"></iframe>
+    </div>
+
 </div>
 
 <!-- ================================================================
@@ -210,7 +238,23 @@ function switchTab(tabName) {
     if (tabName === 'settings') {
         loadConfig();
     }
+    if (tabName === 'history') {
+        loadOutputPath();
+    }
 }
+
+// Load output folder path display
+async function loadOutputPath() {
+    try {
+        const res = await fetch('/api/config');
+        if (!res.ok) return;
+        const cfg = await res.json();
+        const el = document.getElementById('output-path-display');
+        if (el) el.textContent = 'Output: ' + (cfg.output_folder || '/data/output').replace('/data/', './data/');
+    } catch (e) {}
+}
+// Load on startup
+loadOutputPath();
 
 // Listen for clicks on tab buttons
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -278,8 +322,9 @@ function renderFileList() {
         fileList.appendChild(item);
     });
 
-    // Show/hide process button
+    // Show/hide process button and upload options
     processBtn.style.display = pendingFiles.length > 0 ? 'inline-flex' : 'none';
+    document.getElementById('upload-options').style.display = pendingFiles.length > 0 ? '' : 'none';
 
     // Wire up remove buttons
     fileList.querySelectorAll('.remove-btn').forEach(btn => {
@@ -307,6 +352,10 @@ processBtn.addEventListener('click', async () => {
     for (const file of pendingFiles) {
         const formData = new FormData();
         formData.append('files', file);
+        const doRename = document.getElementById('skip-rename-chk').checked;
+        const doTags = document.getElementById('skip-tags-chk').checked;
+        formData.append('skip_rename', doRename ? 'false' : 'true');
+        formData.append('skip_tags', doTags ? 'false' : 'true');
 
         try {
             const res = await fetch('/api/upload', { method: 'POST', body: formData });
@@ -417,7 +466,8 @@ function renderJobHistory(jobs) {
         // Build actions column
         let actionsHtml = '';
         if (job.status === 'done' && job.output_filename) {
-            actionsHtml = `<a href="/api/download/${job.id}" class="btn btn-sm btn-primary" download>Download</a>`;
+            actionsHtml = `<button class="btn btn-sm" onclick="openPdfViewer('${job.id}', '${escapeHtml(job.output_filename)}')">View</button>
+                <a href="/api/download/${job.id}" class="btn btn-sm btn-primary" download>Download</a>`;
         } else if (job.status === 'awaiting_approval') {
             actionsHtml = `
                 <button class="btn btn-sm btn-primary" onclick="openPreviewModal('${job.id}')">Preview</button>
@@ -645,6 +695,8 @@ async function checkWatcherStatus() {
 
         if (checkbox) checkbox.checked = data.running;
         if (statusText) {
+            const path = (data.watching_path || '').replace('/data/', './data/');
+            document.getElementById('watcher-path').textContent = path;
             statusText.textContent = data.running ? 'On — watching' : 'Off';
             statusText.style.color = data.running ? 'var(--success)' : 'var(--text-muted)';
         }
@@ -1090,6 +1142,25 @@ function toggleDetail(detailId) {
             }
         });
     }
+}
+
+// ---- Select All / Upload Options ----
+function toggleSelectAll() {
+    const checked = document.getElementById('select-all-chk').checked;
+    document.getElementById('skip-rename-chk').checked = checked;
+    document.getElementById('skip-tags-chk').checked = checked;
+}
+
+// ---- PDF Viewer Modal ----
+function openPdfViewer(jobId, filename) {
+    document.getElementById('pdf-viewer-title').textContent = filename || 'Document';
+    document.getElementById('pdf-viewer-iframe').src = '/api/download/' + jobId + '#view=FitH';
+    document.getElementById('pdf-viewer-download').href = '/api/download/' + jobId;
+    document.getElementById('pdf-viewer-overlay').style.display = 'block';
+}
+function closePdfViewer() {
+    document.getElementById('pdf-viewer-overlay').style.display = 'none';
+    document.getElementById('pdf-viewer-iframe').src = '';
 }
 
 // ---- Health Check Polling ----

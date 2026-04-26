@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -37,7 +37,7 @@ from app.processor import (
     stop_watcher,
     get_watcher_status,
 )
-from app.tagger import generate_name_and_tags, sanitize_filename, TaggingError
+from app.tagger import generate_filename, generate_tags, sanitize_filename, TaggingError
 from app.pdf_utils import embed_tags_in_pdf
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,8 @@ async def health_check():
 @app.post("/api/upload")
 async def upload_files(
     files: list[UploadFile] = File(...),
+    skip_rename: str = Form("false"),
+    skip_tags: str = Form("false"),
 ):
     """
     Accept one or more files for processing.
@@ -153,7 +155,9 @@ async def upload_files(
     creates a job for each file, and enqueues it into the job queue.
     Jobs are processed one at a time by the queue worker.
 
-    Returns a list of created job summaries.
+    Optional form fields:
+        skip_rename: "true" to skip LLM filename generation
+        skip_tags: "true" to skip LLM tag generation
     """
     settings = get_settings()
     upload_dir = Path(settings.upload_folder)
@@ -161,9 +165,10 @@ async def upload_files(
 
     max_bytes = settings.max_file_size_mb * 1024 * 1024
     jobs_created = []
+    do_skip_rename = skip_rename.lower() == "true"
+    do_skip_tags = skip_tags.lower() == "true"
 
     for file in files:
-        # Validate file extension against the allowed whitelist
         suffix = Path(file.filename).suffix.lower()
         if suffix not in settings.allowed_extensions:
             raise HTTPException(
@@ -172,7 +177,6 @@ async def upload_files(
                        f"Allowed: {', '.join(sorted(settings.allowed_extensions))}",
             )
 
-        # Read file content to check size (StreamingUploadFile doesn't expose .size)
         content = await file.read()
         if len(content) > max_bytes:
             raise HTTPException(
@@ -180,17 +184,18 @@ async def upload_files(
                 detail=f"File '{file.filename}' exceeds max size of {settings.max_file_size_mb} MB",
             )
 
-        # Save the uploaded file to the upload folder
         safe_name = _safe_filename(file.filename)
         file_path = upload_dir / safe_name
         file_path.write_bytes(content)
         logger.info(f"File saved: {file_path}")
 
-        # Create a processing job and enqueue it
-        # The queue worker picks it up and calls process_file()
         job = job_manager.create_job(file.filename)
-        # Store the actual saved file path so retry can find it later
-        job_manager.update_job(job.id, file_path=str(file_path))
+        job_manager.update_job(
+            job.id,
+            file_path=str(file_path),
+            skip_rename=do_skip_rename,
+            skip_tags=do_skip_tags,
+        )
         job_queue.enqueue(job.id, file_path)
 
         jobs_created.append(job.to_dict())
@@ -356,15 +361,9 @@ async def regenerate_name(job_id: str, body: RenameRequest):
 
     settings = get_settings()
 
-    # Use the provided prompt or fall back to the default from settings
-    prompt_template = body.prompt.strip() if body.prompt.strip() else settings.rename_prompt
-
     try:
-        result = await generate_name_and_tags(
-            job.ocr_full_text,
-            prompt_template,
-            settings,
-        )
+        new_name = await generate_filename(job.ocr_full_text, settings)
+        new_tags = await generate_tags(job.ocr_full_text, settings)
     except TaggingError as exc:
         raise HTTPException(
             status_code=502,
@@ -374,13 +373,13 @@ async def regenerate_name(job_id: str, body: RenameRequest):
     # Update job with new proposed values (don't apply to file yet)
     job_manager.update_job(
         job_id,
-        proposed_name=result["filename"],
-        proposed_tags=result["tags"],
+        proposed_name=new_name,
+        proposed_tags=new_tags,
     )
 
     return JSONResponse({
-        "proposed_name": result["filename"],
-        "proposed_tags": result["tags"],
+        "proposed_name": new_name,
+        "proposed_tags": new_tags,
     })
 
 
@@ -442,9 +441,9 @@ async def update_metadata(job_id: str, body: MetadataRequest):
 
     old_path.rename(new_path)
 
-    # Embed tags into the PDF
-    if cleaned_tags:
-        embed_tags_in_pdf(new_path, cleaned_tags)
+    # Embed tags and title into the PDF
+    doc_title = body.filename.strip() if body.filename else job.original_name
+    embed_tags_in_pdf(new_path, cleaned_tags, title=doc_title)
 
     # Mark job as done with the final values
     job_manager.update_job(

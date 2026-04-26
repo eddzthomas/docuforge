@@ -25,7 +25,7 @@ from pdf2image import convert_from_path
 from app.config import Settings, get_settings
 from app.ocr import ocr_page, OCRError
 from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf, embed_tags_in_pdf
-from app.tagger import generate_name_and_tags, sanitize_filename, TaggingError
+from app.tagger import generate_filename, generate_tags, sanitize_filename, TaggingError
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,9 @@ class JobData:
         self.file_path: Optional[str] = None       # Saved upload path for retry
         self.page_errors: list[dict] = []          # Per-page OCR failures
         self.pdfa_saved: bool = False              # True if PDF/A was generated (partial output)
+        # Sprint 7 — Skip tagging/renaming
+        self.skip_rename: bool = False
+        self.skip_tags: bool = False
 
     def to_dict(self) -> dict:
         """
@@ -332,25 +335,25 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
         output_path = Path(settings.output_folder) / output_filename
         layer_text_on_pdf(pdfa_tmp, ocr_results, output_path, settings.dpi)
 
-        # ---- Step 6: Generate name & tags via LLM ----
-        # Only attempt if we have OCR text and a tagging model configured
-        if ocr_full_text and settings.tagging_model:
+        # ---- Step 6: Generate name & tags via LLM (independently optional) ----
+        proposed_name = file_path.stem
+        proposed_tags = []
+
+        # Rename: only if enabled and OCR text exists
+        if not job.skip_rename and ocr_full_text and settings.tagging_model:
             try:
-                tagging_result = await generate_name_and_tags(
-                    ocr_full_text,
-                    settings.rename_prompt,
-                    settings,
-                )
-                proposed_name = tagging_result.get("filename", file_path.stem)
-                proposed_tags = tagging_result.get("tags", [])
+                proposed_name = await generate_filename(ocr_full_text, settings)
             except TaggingError as exc:
-                # Tagging LLM call failed — fall back to original name, no tags
-                logger.warning(f"Job {job_id}: Tagging failed: {exc}")
+                logger.warning(f"Job {job_id}: Rename failed: {exc}")
                 proposed_name = file_path.stem
+
+        # Tags: only if enabled and OCR text exists
+        if not job.skip_tags and ocr_full_text and settings.tagging_model:
+            try:
+                proposed_tags = await generate_tags(ocr_full_text, settings)
+            except TaggingError as exc:
+                logger.warning(f"Job {job_id}: Tagging failed: {exc}")
                 proposed_tags = []
-        else:
-            proposed_name = file_path.stem
-            proposed_tags = []
 
         # ---- Step 7: Finalize based on AUTO_RENAME setting ----
         if settings.auto_rename:
@@ -364,9 +367,8 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 output_path = final_path
                 output_filename = final_name
 
-            # Embed tags into the PDF/A XMP metadata
-            if proposed_tags:
-                embed_tags_in_pdf(output_path, proposed_tags)
+            # Embed tags and title into the PDF/A XMP metadata
+            embed_tags_in_pdf(output_path, proposed_tags, title=proposed_name)
 
             job_manager.update_job(
                 job_id,

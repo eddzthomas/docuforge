@@ -1,13 +1,13 @@
 """
 DocuForge — LLM Renaming & Tagging
 ===================================
-Sends OCR'd document text to a local LLM via Ollama to generate
-a descriptive filename and up to 5 tags for the document.
+Two independent functions:
+  - generate_filename() — LLM suggests a descriptive filename
+  - generate_tags()     — LLM suggests up to 5 relevant tags
 
-Uses the same defensive parsing pattern as the OCR module:
-  - Attempt structured JSON first
-  - Strip markdown wrappers and retry
-  - Fall back to sensible defaults if all parsing fails
+Each has its own focused Ollama call for better output quality.
+The functions can be called independently (skip rename but still tag,
+or skip tags but still rename).
 """
 
 import json
@@ -21,68 +21,119 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
-# Maximum OCR text length sent to the LLM (chars).
-# Truncating avoids blowing the model's context window while
-# keeping enough text for accurate classification.
 MAX_OCR_TEXT_LENGTH = 4000
-
-# Maximum number of tags allowed (matches PRD spec)
 MAX_TAGS = 5
 
 
 class TaggingError(Exception):
-    """
-    Raised when the rename/tag LLM call fails due to an
-    unreachable Ollama instance, model not pulled, or
-    unparseable response.
-    """
-
+    """Raised when the rename/tag LLM call fails."""
     pass
 
 
-async def generate_name_and_tags(
+async def generate_filename(
     ocr_text: str,
-    prompt_template: str,
     settings: Settings,
-) -> dict:
+) -> str:
     """
-    Send document OCR text to an LLM and get back a filename + tags.
+    Ask the LLM to suggest a descriptive filename from OCR text.
 
     Args:
         ocr_text: The full OCR'd text from the document.
-        prompt_template: A prompt template string containing {ocr_text}.
         settings: Application settings (tagging model, Ollama host).
 
     Returns:
-        dict with keys:
-            - "filename": str  — Proposed filename (without extension)
-            - "tags": list[str] — Up to 5 relevant tags
+        Suggested filename (without extension), sanitized for filesystem.
 
     Raises:
         TaggingError: If Ollama is unreachable or the response is broken.
     """
     if not ocr_text or not ocr_text.strip():
-        logger.warning("No OCR text available for tagging — using defaults")
-        return {"filename": "untitled", "tags": []}
+        return "untitled"
 
-    # Truncate OCR text to avoid blowing the LLM context window
     truncated = ocr_text[:MAX_OCR_TEXT_LENGTH].strip()
 
-    # Inject OCR text into the prompt template
-    prompt = prompt_template.replace("{ocr_text}", truncated)
+    prompt = (
+        "Analyze the following document text and suggest a concise, "
+        "descriptive filename (without extension, max 150 chars, "
+        "use underscores between words). Include the date if present. "
+        "Return ONLY a single filename string, no JSON, no explanation.\n\n"
+        f"Document text:\n{truncated}"
+    )
 
-    # Build the Ollama API payload
+    raw = await _call_ollama(prompt, settings)
+
+    # Parse: LLM may return plain text, JSON, or JSON-wrapped text
+    name = _extract_filename(raw)
+    if not name:
+        return "untitled"
+    return name[:200]
+
+
+def _extract_filename(raw: str) -> str:
+    """Extract a filename from raw LLM output, handling JSON and plain text."""
+    raw = raw.strip()
+    # Try JSON: {"filename": "..."} or just a quoted string
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            name = data.get("filename") or list(data.keys())[0]
+            return str(name).strip().strip("\"'")
+        if isinstance(data, str):
+            return data.strip().strip("\"'")
+    except json.JSONDecodeError:
+        pass
+    # Plain text: take first non-empty line
+    lines = [l.strip().strip("\"'") for l in raw.split("\n") if l.strip()]
+    if lines:
+        return lines[0]
+    return ""
+
+
+async def generate_tags(
+    ocr_text: str,
+    settings: Settings,
+) -> list[str]:
+    """
+    Ask the LLM to suggest up to 5 tags from OCR text.
+
+    Args:
+        ocr_text: The full OCR'd text from the document.
+        settings: Application settings (tagging model, Ollama host).
+
+    Returns:
+        List of up to 5 tag strings.
+
+    Raises:
+        TaggingError: If Ollama is unreachable or the response is broken.
+    """
+    if not ocr_text or not ocr_text.strip():
+        return []
+
+    truncated = ocr_text[:MAX_OCR_TEXT_LENGTH].strip()
+
+    prompt = (
+        "Analyze the following document text and suggest up to 5 tags "
+        "that describe the document type, parties, subject, and year. "
+        "Return ONLY a JSON array of strings, like: "
+        '["invoice", "acme-corp", "2025"]. No explanation.\n\n'
+        f"Document text:\n{truncated}"
+    )
+
+    raw = await _call_ollama(prompt, settings)
+
+    return _parse_tag_array(raw)
+
+
+async def _call_ollama(prompt: str, settings: Settings) -> str:
+    """Send a prompt to Ollama and return the raw response text."""
     payload = {
         "model": settings.tagging_model,
         "prompt": prompt,
         "stream": False,
-        "format": "json",  # Request structured JSON output
-        "options": {
-            "temperature": 0.0,  # Deterministic output for naming
-        },
+        "format": "json",
+        "options": {"temperature": 0.0},
     }
 
-    # Call the Ollama API
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
@@ -91,119 +142,63 @@ async def generate_name_and_tags(
             )
             response.raise_for_status()
     except httpx.ConnectError as exc:
-        raise TaggingError(
-            f"Cannot connect to Ollama at {settings.ollama_host}"
-        ) from exc
+        raise TaggingError(f"Cannot connect to Ollama at {settings.ollama_host}") from exc
     except httpx.HTTPStatusError as exc:
-        raise TaggingError(
-            f"Ollama API returned HTTP {exc.response.status_code}"
-        ) from exc
+        raise TaggingError(f"Ollama API returned HTTP {exc.response.status_code}") from exc
     except httpx.TimeoutException as exc:
-        raise TaggingError("Ollama timed out after 60s for tagging") from exc
+        raise TaggingError("Ollama timed out after 60s") from exc
     except httpx.HTTPError as exc:
         raise TaggingError(f"Ollama API call failed: {exc}") from exc
 
-    # Parse the response
     result = response.json()
-    raw_response = result.get("response", "")
-
-    return _parse_tagging_response(raw_response)
+    return result.get("response", "")
 
 
-def _parse_tagging_response(raw: str) -> dict:
-    """
-    Parse the LLM tagging response with defensive fallback.
-
-    Tier 1: Valid JSON with filename + tags
-    Tier 2: Strip markdown wrappers, retry JSON parse
-    Tier 3: Use safe defaults
-
-    Args:
-        raw: Raw text response from Ollama.
-
-    Returns:
-        Normalized dict with filename and tags.
-    """
-    # ---- Tier 1: Direct JSON parse ----
+def _parse_tag_array(raw: str) -> list[str]:
+    """Parse a JSON array of tags from LLM output with defensive fallback."""
+    # Tier 1: Direct JSON parse
     try:
         data = json.loads(raw)
-        return _validate_and_clean(data)
+        if isinstance(data, list):
+            tags = [str(t).strip() for t in data if str(t).strip()]
+            return tags[:MAX_TAGS]
+        if isinstance(data, dict) and "tags" in data:
+            tags = [str(t).strip() for t in data["tags"] if str(t).strip()]
+            return tags[:MAX_TAGS]
     except json.JSONDecodeError:
         pass
 
-    # ---- Tier 2: Strip markdown code fences and retry ----
+    # Tier 2: Strip markdown wrappers
     cleaned = raw.strip()
-    # Remove ```json or ``` wrappers that LLMs sometimes add
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    elif cleaned.startswith("```"):
-        cleaned = cleaned[3:]
+    for prefix in ("```json", "```"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
     if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
-
+        cleaned = cleaned[:-3].strip()
     try:
         data = json.loads(cleaned)
-        logger.info("JSON recovered after stripping markdown wrappers")
-        return _validate_and_clean(data)
+        if isinstance(data, list):
+            return [str(t).strip() for t in data if str(t).strip()][:MAX_TAGS]
     except json.JSONDecodeError:
         pass
 
-    # ---- Tier 3: Extract JSON object from text via regex ----
-    # Some models return JSON embedded in explanatory text.
-    match = re.search(r'\{[^{}]*"filename"\s*:.*?\}', raw, re.DOTALL)
+    # Tier 3: Regex extraction
+    match = re.search(r'\[[^\]]*\]', raw)
     if match:
         try:
             data = json.loads(match.group())
-            logger.info("JSON extracted from text via regex")
-            return _validate_and_clean(data)
+            if isinstance(data, list):
+                return [str(t).strip() for t in data if str(t).strip()][:MAX_TAGS]
         except json.JSONDecodeError:
             pass
 
-    # ---- Tier 4: Ultimate fallback ----
-    logger.warning(
-        f"Could not parse tagging response. "
-        f"Raw (first 200 chars): {raw[:200]}"
-    )
-    return {"filename": "untitled", "tags": []}
+    # Tier 4: Comma-separated plain text
+    parts = [p.strip().strip('"') for p in raw.split(",") if p.strip()]
+    if parts:
+        return parts[:MAX_TAGS]
 
-
-def _validate_and_clean(data: dict) -> dict:
-    """
-    Validate and normalize the LLM response for filename and tags.
-
-    Enforces constraints:
-      - filename must be a non-empty string
-      - tags must be a list of strings, max MAX_TAGS items
-      - Strips whitespace and unsafe characters
-
-    Args:
-        data: Raw parsed JSON from the LLM.
-
-    Returns:
-        Cleaned dict with filename and tags.
-    """
-    # Validate filename
-    filename = str(data.get("filename", "")).strip()
-    if not filename or len(filename) > 200:
-        filename = "untitled"
-
-    # Validate tags
-    raw_tags = data.get("tags", [])
-    if not isinstance(raw_tags, list):
-        raw_tags = []
-
-    tags = []
-    for tag in raw_tags:
-        tag_str = str(tag).strip()
-        # Skip empty, overly long, or duplicate tags
-        if tag_str and len(tag_str) <= 50 and tag_str not in tags:
-            tags.append(tag_str)
-        if len(tags) >= MAX_TAGS:
-            break
-
-    logger.info(f"Tagging result: filename='{filename}', tags={tags}")
-    return {"filename": filename, "tags": tags}
+    logger.warning(f"Could not parse tag response. Raw: {raw[:200]}")
+    return []
 
 
 def sanitize_filename(raw: str, extension: str = ".pdf") -> str:
@@ -231,7 +226,6 @@ def sanitize_filename(raw: str, extension: str = ".pdf") -> str:
     if name.lower().endswith(extension.lower()):
         name = name[: -len(extension)]
     elif "." in name:
-        # Remove any other extension that might be present
         name = name.rsplit(".", 1)[0]
 
     # Replace unsafe characters with underscores

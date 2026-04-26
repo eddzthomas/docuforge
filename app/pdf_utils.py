@@ -376,42 +376,52 @@ def _ensure_helvetica_font(page):
 # ---------------------------------------------------------------------------
 
 
-def embed_tags_in_pdf(pdf_path: Path, tags: list[str]):
+def embed_tags_in_pdf(pdf_path: Path, tags: list[str], title: str | None = None):
     """
-    Inject document tags into the PDF/A XMP metadata.
+    Inject document tags and title into the PDF metadata.
 
-    Tags are written to two XMP namespaces:
-      - dc:subject       —  Dublin Core standard subject field (as bag of items)
-      - docuforge:tags   —  Custom namespace for application-level tag queries
+    Tags are written to:
+      - dc:subject       — Dublin Core subject (XMP)
+      - docuforge:tags   — Custom namespace (XMP)
+      - pdf:Keywords     — Standard PDF document info (visible in Acrobat)
 
-    The PDF is modified in-place. The original visual content is unchanged.
+    Title is written to:
+      - dc:title         — Dublin Core title (XMP)
+
+    Creator is set to:
+      - dc:creator       — "DocuForge"
+
+    The PDF is modified in-place.
 
     Args:
         pdf_path: Path to the PDF/A file to modify.
-        tags: List of tag strings to embed. Empty list removes existing tags.
+        tags: List of tag strings. Empty list removes existing tags.
+        title: Document title (e.g., LLM-generated filename). Optional.
     """
-    if not tags:
-        logger.debug(f"No tags to embed in {pdf_path.name}")
+    if not tags and not title:
+        logger.debug(f"No metadata to embed in {pdf_path.name}")
         return
 
-    logger.info(f"Embedding {len(tags)} tag(s) into {pdf_path.name}")
+    logger.info(f"Embedding metadata into {pdf_path.name}: tags={tags}, title={title}")
 
-    # Open the PDF/A with overwrite allowed (in-place edit)
     pdf = pikepdf.open(pdf_path, allow_overwriting_input=True)
 
     with pdf.open_metadata() as meta:
-        # Write tags to Dublin Core subject field
-        # dc:subject is a bag (unordered list) of text items
-        meta["dc:subject"] = tags
+        if tags:
+            meta["dc:subject"] = tags
+            meta["docuforge:tags"] = tags
+        if title:
+            meta["dc:title"] = title
+        meta["dc:creator"] = "DocuForge"
 
-        # Write tags to our custom namespace for future filtering
-        meta["docuforge:tags"] = tags
+    # Also set Keywords in the document info dictionary (Acrobat visible)
+    if tags:
+        pdf.docinfo["/Keywords"] = ", ".join(tags)
 
-    # Save in-place — overwrites the file with updated metadata
     pdf.save(pdf_path, linearize=True)
     pdf.close()
 
-    logger.debug(f"Tags embedded successfully in {pdf_path.name}")
+    logger.debug(f"Metadata embedded in {pdf_path.name}")
 
 
 # ---------------------------------------------------------------------------
