@@ -20,7 +20,14 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
-from app.config import get_settings
+from app.config import (
+    Settings,
+    get_settings,
+    get_settings_dict,
+    get_editable_fields,
+    save_settings_to_json,
+    reload_settings,
+)
 from app.processor import (
     job_manager,
     job_queue,
@@ -508,6 +515,100 @@ async def watcher_stop():
 
 
 # =============================================================================
-# Future Sprint Routes (not yet implemented)
+# Sprint 4: Configuration Panel
 # =============================================================================
-# Sprint 4: POST /api/config, GET /api/config
+
+
+@app.get("/api/config")
+async def get_config():
+    """
+    Return all current application settings.
+
+    The UI calls this to populate the Settings form fields.
+    """
+    return JSONResponse(get_settings_dict())
+
+
+@app.post("/api/config")
+async def update_config(body: dict):
+    """
+    Update application settings and persist them to disk.
+
+    Accepts a partial dict — only the fields that changed need
+    to be sent. Unknown or non-editable fields are silently ignored.
+    Missing editable fields keep their current value.
+
+    Body:
+        Any subset of: ollama_host, ocr_model, tagging_model, dpi,
+        pdfa_level, max_file_size_mb, watch_interval, auto_rename,
+        rename_prompt
+    """
+    editable = get_editable_fields()
+    settings = get_settings()
+
+    # Start with current values
+    merged = {}
+    for field in editable:
+        merged[field] = body.get(field, getattr(settings, field, None))
+
+    # Validate by attempting to construct a Settings object
+    try:
+        validated = Settings(**merged)
+    except Exception as exc:
+        # Pydantic validation failed — return field-level errors
+        errors = []
+        if hasattr(exc, "errors"):
+            for err in exc.errors():
+                errors.append({
+                    "field": ".".join(str(loc) for loc in err["loc"]),
+                    "message": err["msg"],
+                })
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "Validation failed", "validation_errors": errors},
+        )
+
+    # Persist and reload
+    save_settings_to_json(merged)
+    reload_settings()
+
+    # Return the fresh config so the UI can confirm
+    return JSONResponse(get_settings_dict())
+
+
+@app.get("/api/config/test-ollama")
+async def test_ollama_connection():
+    """
+    Test connectivity to the configured Ollama instance.
+
+    Pings GET {ollama_host}/api/tags and returns reachable status
+    plus a list of available models.
+    """
+    settings = get_settings()
+    result = {
+        "reachable": False,
+        "host": settings.ollama_host,
+        "models": [],
+        "error": None,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{settings.ollama_host}/api/tags")
+            if response.status_code == 200:
+                data = response.json()
+                models = data.get("models", [])
+                result["reachable"] = True
+                result["models"] = [
+                    m.get("name", "unknown") for m in models
+                ]
+            else:
+                result["error"] = f"HTTP {response.status_code}: {response.text[:200]}"
+    except httpx.ConnectError:
+        result["error"] = f"Connection refused — is Ollama running at {settings.ollama_host}?"
+    except httpx.TimeoutException:
+        result["error"] = "Connection timed out after 10 seconds"
+    except Exception as exc:
+        result["error"] = str(exc)[:300]
+
+    return JSONResponse(result)

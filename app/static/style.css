@@ -471,6 +471,20 @@ header p {
     transition: width 0.4s ease;
 }
 
+/* ---- Settings result indicators ---- */
+#test-ollama-result,
+#save-result {
+    min-height: 1.2em;
+    line-height: 1.4;
+}
+
+#test-ollama-result code {
+    background: var(--bg-tertiary);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: var(--mono);
+}
+
 /* ---- Status Bar ---- */
 .status-bar {
     display: flex;

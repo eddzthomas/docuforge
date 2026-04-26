@@ -110,56 +110,61 @@
 
     <!-- ============================================================
          TAB 3: Settings
-         Configuration form (functional in Sprint 4)
+         Configuration form — loads from API, saves to persistent JSON
          ============================================================ -->
     <div class="tab-panel" id="panel-settings">
         <form class="settings-form" id="settings-form" onsubmit="return false;">
+            <!-- Ollama Host + Test Connection button -->
             <div class="form-group">
                 <label for="cfg-ollama-host">Ollama Host</label>
-                <input type="text" id="cfg-ollama-host" value="http://ollama:11434" disabled>
+                <div style="display:flex;gap:8px;">
+                    <input type="text" id="cfg-ollama-host" value="http://ollama:11434" style="flex:1;">
+                    <button type="button" class="btn btn-sm" id="test-ollama-btn" onclick="testOllamaConnection()">Test Connection</button>
+                </div>
+                <div id="test-ollama-result" style="font-size:0.75rem;margin-top:4px;"></div>
             </div>
             <div class="form-group">
                 <label for="cfg-ocr-model">OCR Model</label>
-                <input type="text" id="cfg-ocr-model" value="glm-ocr" disabled>
+                <input type="text" id="cfg-ocr-model" value="glm-ocr">
             </div>
             <div class="form-group">
                 <label for="cfg-tagging-model">Tagging Model</label>
-                <input type="text" id="cfg-tagging-model" value="llama3.2" disabled>
+                <input type="text" id="cfg-tagging-model" value="llama3.2">
             </div>
             <div class="form-group">
                 <label for="cfg-dpi">Render DPI</label>
-                <input type="number" id="cfg-dpi" value="300" min="72" max="600" disabled>
+                <input type="number" id="cfg-dpi" value="300" min="72" max="600">
             </div>
             <div class="form-group">
                 <label for="cfg-pdfa-level">PDF/A Level</label>
-                <select id="cfg-pdfa-level" disabled>
+                <select id="cfg-pdfa-level">
                     <option value="2b">PDF/A-2b</option>
                     <option value="3b">PDF/A-3b</option>
                 </select>
             </div>
             <div class="form-group">
+                <label for="cfg-max-size">Max Upload Size (MB)</label>
+                <input type="number" id="cfg-max-size" value="100" min="1" max="500">
+            </div>
+            <div class="form-group">
+                <label for="cfg-watch-interval">Folder Watch Interval (sec)</label>
+                <input type="number" id="cfg-watch-interval" value="5" min="1" max="60">
+            </div>
+            <div class="form-group">
                 <label for="cfg-auto-rename">Auto-rename</label>
-                <select id="cfg-auto-rename" disabled>
+                <select id="cfg-auto-rename">
                     <option value="false">Off (manual approval)</option>
                     <option value="true">On (auto-apply)</option>
                 </select>
             </div>
             <div class="form-group">
                 <label for="cfg-rename-prompt">Rename Prompt Template</label>
-                <textarea id="cfg-rename-prompt" rows="6" disabled>
-You are a document archivist. Given the following OCR'd text, suggest:
-1. A concise filename (max 150 chars). Use underscores.
-2. Up to 5 tags for type, parties, subject, year.
-
-Return JSON: {"filename": "...", "tags": [...]}
-
-Document text:
-{ocr_text}
-                </textarea>
+                <textarea id="cfg-rename-prompt" rows="6" placeholder="Prompt must include {ocr_text} placeholder"></textarea>
             </div>
-            <button type="submit" class="btn btn-primary" disabled>
-                Save Settings (coming in Sprint 4)
+            <button type="submit" class="btn btn-primary" id="save-settings-btn" onclick="saveConfig()">
+                Save Settings
             </button>
+            <div id="save-result" style="font-size:0.8rem;margin-top:8px;"></div>
         </form>
     </div>
 
@@ -193,6 +198,11 @@ function switchTab(tabName) {
     if (btn) btn.classList.add('active');
     const panel = document.getElementById('panel-' + tabName);
     if (panel) panel.classList.add('active');
+
+    // Load config from API when switching to Settings tab
+    if (tabName === 'settings') {
+        loadConfig();
+    }
 }
 
 // Listen for clicks on tab buttons
@@ -822,6 +832,145 @@ async function quickApprove(jobId) {
         refreshJobs();
     } catch (err) {
         showToast('Network error', 'error');
+    }
+}
+
+// ---- Settings / Configuration ----
+// Fetches current settings from the API and populates the form
+async function loadConfig() {
+    try {
+        const res = await fetch('/api/config');
+        if (!res.ok) return;
+        const cfg = await res.json();
+
+        // Populate form fields from config values
+        setFieldValue('cfg-ollama-host', cfg.ollama_host);
+        setFieldValue('cfg-ocr-model', cfg.ocr_model);
+        setFieldValue('cfg-tagging-model', cfg.tagging_model);
+        setFieldValue('cfg-dpi', cfg.dpi);
+        setFieldValue('cfg-pdfa-level', cfg.pdfa_level);
+        setFieldValue('cfg-max-size', cfg.max_file_size_mb);
+        setFieldValue('cfg-watch-interval', cfg.watch_interval);
+        setFieldValue('cfg-auto-rename', cfg.auto_rename ? 'true' : 'false');
+        setFieldValue('cfg-rename-prompt', cfg.rename_prompt);
+    } catch (err) {
+        console.error('Failed to load config:', err);
+    }
+}
+
+// Safely set a form field value by ID
+function setFieldValue(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'select-one' || el.tagName === 'SELECT') {
+        // Find and select the matching option
+        for (const opt of el.options) {
+            if (String(opt.value) === String(value)) {
+                el.value = opt.value;
+                return;
+            }
+        }
+    }
+    el.value = value ?? '';
+}
+
+// Save settings from the form back to the API
+async function saveConfig() {
+    const btn = document.getElementById('save-settings-btn');
+    const resultEl = document.getElementById('save-result');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+    }
+
+    // Gather form data
+    const data = {
+        ollama_host: document.getElementById('cfg-ollama-host').value.trim(),
+        ocr_model: document.getElementById('cfg-ocr-model').value.trim(),
+        tagging_model: document.getElementById('cfg-tagging-model').value.trim(),
+        dpi: parseInt(document.getElementById('cfg-dpi').value) || 300,
+        pdfa_level: document.getElementById('cfg-pdfa-level').value,
+        max_file_size_mb: parseInt(document.getElementById('cfg-max-size').value) || 100,
+        watch_interval: parseInt(document.getElementById('cfg-watch-interval').value) || 5,
+        auto_rename: document.getElementById('cfg-auto-rename').value === 'true',
+        rename_prompt: document.getElementById('cfg-rename-prompt').value,
+    };
+
+    try {
+        const res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+        });
+
+        if (res.ok) {
+            const updated = await res.json();
+            // Re-populate with server-validated values
+            setFieldValue('cfg-dpi', updated.dpi);
+            setFieldValue('cfg-max-size', updated.max_file_size_mb);
+            setFieldValue('cfg-watch-interval', updated.watch_interval);
+            if (resultEl) {
+                resultEl.innerHTML = '<span style="color:var(--success)">Settings saved successfully</span>';
+                setTimeout(() => { resultEl.innerHTML = ''; }, 3000);
+            }
+            showToast('Settings saved', 'success');
+        } else {
+            const err = await res.json();
+            let msg = 'Failed to save settings';
+            if (err.detail && err.detail.validation_errors) {
+                msg = err.detail.validation_errors.map(e => e.message).join('; ');
+            } else if (err.detail) {
+                msg = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+            }
+            if (resultEl) {
+                resultEl.innerHTML = `<span style="color:var(--danger)">${escapeHtml(msg)}</span>`;
+                setTimeout(() => { resultEl.innerHTML = ''; }, 5000);
+            }
+            showToast('Save failed: ' + msg, 'error');
+        }
+    } catch (err) {
+        if (resultEl) {
+            resultEl.innerHTML = '<span style="color:var(--danger)">Network error</span>';
+            setTimeout(() => { resultEl.innerHTML = ''; }, 3000);
+        }
+        showToast('Network error', 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Save Settings';
+        }
+    }
+}
+
+// Test Ollama connectivity from the Settings tab
+async function testOllamaConnection() {
+    const resultEl = document.getElementById('test-ollama-result');
+    const btn = document.getElementById('test-ollama-btn');
+    if (resultEl) resultEl.innerHTML = '<span style="color:var(--text-secondary)">Testing...</span>';
+    if (btn) btn.disabled = true;
+
+    try {
+        const res = await fetch('/api/config/test-ollama');
+        const data = await res.json();
+
+        if (data.reachable) {
+            const modelList = data.models.length > 0
+                ? data.models.slice(0, 5).map(m => `<code style="font-size:0.7rem">${escapeHtml(m)}</code>`).join(', ')
+                : 'no models pulled';
+            if (resultEl) {
+                resultEl.innerHTML = `<span style="color:var(--success)">Connected</span> — ${modelList}`;
+            }
+        } else {
+            if (resultEl) {
+                resultEl.innerHTML = `<span style="color:var(--danger)">Not reachable</span> — ${escapeHtml(data.error || 'unknown error')}`;
+            }
+        }
+    } catch (err) {
+        if (resultEl) {
+            resultEl.innerHTML = '<span style="color:var(--danger)">Request failed</span>';
+        }
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 
