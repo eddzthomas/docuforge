@@ -361,3 +361,46 @@ def _draw_invisible_text(
         logger.warning(
             f"Failed to insert text at ({x:.0f}, {y:.0f}): {exc}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tag Embedding (Sprint 2)
+# ---------------------------------------------------------------------------
+
+
+def embed_tags_in_pdf(pdf_path: Path, tags: list[str]):
+    """
+    Inject document tags into the PDF/A XMP metadata.
+
+    Tags are written to two XMP namespaces:
+      - dc:subject       —  Dublin Core standard subject field (as bag of items)
+      - docuforge:tags   —  Custom namespace for application-level tag queries
+
+    The PDF is modified in-place. The original visual content is unchanged.
+
+    Args:
+        pdf_path: Path to the PDF/A file to modify.
+        tags: List of tag strings to embed. Empty list removes existing tags.
+    """
+    if not tags:
+        logger.debug(f"No tags to embed in {pdf_path.name}")
+        return
+
+    logger.info(f"Embedding {len(tags)} tag(s) into {pdf_path.name}")
+
+    # Open the PDF/A with overwrite allowed (in-place edit)
+    pdf = pikepdf.open(pdf_path, allow_overwriting_input=True)
+
+    with pdf.open_metadata() as meta:
+        # Write tags to Dublin Core subject field
+        # dc:subject is a bag (unordered list) of text items
+        meta["dc:subject"] = tags
+
+        # Write tags to our custom namespace for future filtering
+        meta["docuforge:tags"] = tags
+
+    # Save in-place — overwrites the file with updated metadata
+    pdf.save(pdf_path, linearize=True)
+    pdf.close()
+
+    logger.debug(f"Tags embedded successfully in {pdf_path.name}")

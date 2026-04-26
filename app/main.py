@@ -8,6 +8,7 @@ Defines routes, mounts static files, and serves the UI.
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -16,10 +17,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.background import BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from app.config import get_settings
 from app.processor import job_manager, process_file, JobStatus
+from app.tagger import generate_name_and_tags, sanitize_filename, TaggingError
+from app.pdf_utils import embed_tags_in_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +239,197 @@ def _safe_filename(filename: str) -> str:
 
 
 # =============================================================================
+# Sprint 2: Renaming & Tagging
+# =============================================================================
+
+
+class RenameRequest(BaseModel):
+    """Request body for regenerating name/tags with a custom prompt."""
+    prompt: str = Field(
+        default="",
+        description="Custom prompt template. Uses {ocr_text} placeholder. "
+                    "Empty = use the default prompt from settings.",
+    )
+
+
+class MetadataRequest(BaseModel):
+    """Request body for manually overriding filename and tags."""
+    filename: str = Field(..., description="New filename (without extension)")
+    tags: list[str] = Field(default_factory=list, description="Up to 5 tags")
+
+
+@app.get("/api/jobs/{job_id}/preview")
+async def preview_job(job_id: str):
+    """
+    Return OCR text + proposed name/tags for the approval modal.
+
+    Returns 404 if the job has no OCR text available.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    if not job.ocr_full_text:
+        raise HTTPException(
+            status_code=404,
+            detail="No OCR text available for this job",
+        )
+
+    return JSONResponse({
+        "ocr_full_text": job.ocr_full_text,
+        "proposed_name": job.proposed_name,
+        "proposed_tags": job.proposed_tags,
+    })
+
+
+@app.post("/api/jobs/{job_id}/rename")
+async def regenerate_name(job_id: str, body: RenameRequest):
+    """
+    Regenerate the filename and tags with a new LLM prompt.
+
+    The new suggestions are stored on the job but NOT applied to the
+    file until the user approves via PUT /api/jobs/{id}/metadata.
+
+    Body:
+        prompt: Custom prompt template (optional — uses default if empty).
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    if not job.ocr_full_text:
+        raise HTTPException(
+            status_code=400,
+            detail="No OCR text available for renaming",
+        )
+
+    settings = get_settings()
+
+    # Use the provided prompt or fall back to the default from settings
+    prompt_template = body.prompt.strip() if body.prompt.strip() else settings.rename_prompt
+
+    try:
+        result = await generate_name_and_tags(
+            job.ocr_full_text,
+            prompt_template,
+            settings,
+        )
+    except TaggingError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Tagging LLM call failed: {exc}",
+        )
+
+    # Update job with new proposed values (don't apply to file yet)
+    job_manager.update_job(
+        job_id,
+        proposed_name=result["filename"],
+        proposed_tags=result["tags"],
+    )
+
+    return JSONResponse({
+        "proposed_name": result["filename"],
+        "proposed_tags": result["tags"],
+    })
+
+
+@app.put("/api/jobs/{job_id}/metadata")
+async def update_metadata(job_id: str, body: MetadataRequest):
+    """
+    Finalize a job by applying the approved filename and tags.
+
+    This renames the output file on disk, embeds tags into the
+    PDF/A XMP metadata, and marks the job as done.
+
+    Body:
+        filename: Final filename (will be sanitized).
+        tags: Final list of tags.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    if not job.output_filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Job has no output file yet",
+        )
+
+    settings = get_settings()
+
+    # Sanitize the user-provided filename
+    final_name = sanitize_filename(body.filename)
+
+    # Validate tags
+    cleaned_tags = []
+    for tag in body.tags:
+        tag_str = str(tag).strip()
+        if tag_str and len(tag_str) <= 50 and tag_str not in cleaned_tags:
+            cleaned_tags.append(tag_str)
+        if len(cleaned_tags) >= 5:
+            break
+
+    # Rename the file on disk
+    old_path = Path(settings.output_folder) / job.output_filename
+    new_path = Path(settings.output_folder) / final_name
+
+    if not old_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Output file not found: {job.output_filename}",
+        )
+
+    # Avoid collision — if new_path already exists for a different job, add suffix
+    if new_path.exists() and new_path != old_path:
+        stem = new_path.stem
+        suffix = new_path.suffix
+        counter = 1
+        while new_path.exists():
+            new_path = Path(settings.output_folder) / f"{stem}_{counter}{suffix}"
+            counter += 1
+        final_name = new_path.name
+
+    old_path.rename(new_path)
+
+    # Embed tags into the PDF
+    if cleaned_tags:
+        embed_tags_in_pdf(new_path, cleaned_tags)
+
+    # Mark job as done with the final values
+    job_manager.update_job(
+        job_id,
+        status=JobStatus.DONE,
+        finished_at=datetime.now(timezone.utc) if not job.finished_at else None,
+        output_filename=final_name,
+        tags=cleaned_tags,
+        proposed_name=body.filename,
+        proposed_tags=cleaned_tags,
+    )
+
+    return JSONResponse(job_manager.get_job(job_id).to_dict())
+
+
+@app.get("/api/tags")
+async def list_tags():
+    """
+    Return all unique tags across all jobs with usage counts.
+
+    Used to populate the tag filter dropdown/bar in the UI.
+    """
+    tag_counts: dict[str, int] = {}
+    for job_dict in job_manager.list_jobs():
+        for tag in job_dict.get("tags", []):
+            if tag:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+    # Sort by count descending, then alphabetically
+    sorted_tags = sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))
+    return JSONResponse([
+        {"tag": tag, "count": count} for tag, count in sorted_tags
+    ])
+
+
+# =============================================================================
 # Future Sprint Routes (not yet implemented)
 # =============================================================================
-# Sprint 2: POST /api/jobs/{id}/rename, PUT /api/jobs/{id}/metadata,
-#           GET /api/jobs/{id}/preview
 # Sprint 4: POST /api/config, GET /api/config

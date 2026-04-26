@@ -22,7 +22,8 @@ from pdf2image import convert_from_path
 
 from app.config import Settings, get_settings
 from app.ocr import ocr_page, OCRError
-from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf
+from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf, embed_tags_in_pdf
+from app.tagger import generate_name_and_tags, sanitize_filename, TaggingError
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +31,16 @@ logger = logging.getLogger(__name__)
 class JobStatus(str, Enum):
     """
     Lifecycle of a processing job.
-    queued      — File uploaded, waiting to be processed
-    processing  — Pipeline is actively running
-    done        — Processing completed successfully
-    failed      — Processing encountered an unrecoverable error
+    queued             — File uploaded, waiting to be processed
+    processing         — Pipeline is actively running
+    awaiting_approval  — OCR+PDF/A done, waiting for user to approve name/tags
+    done               — Processing completed successfully
+    failed             — Processing encountered an unrecoverable error
     """
 
     QUEUED = "queued"
     PROCESSING = "processing"
+    AWAITING_APPROVAL = "awaiting_approval"
     DONE = "done"
     FAILED = "failed"
 
@@ -75,6 +78,9 @@ class JobData:
         self.tags: list[str] = []
         self.ocr_full_text: Optional[str] = None
         self.tier_summary: dict[str, int] = {}
+        # Sprint 2 — Renaming & Tagging
+        self.proposed_name: Optional[str] = None
+        self.proposed_tags: list[str] = []
 
     def to_dict(self) -> dict:
         """
@@ -92,6 +98,9 @@ class JobData:
             "error": self.error,
             "tags": self.tags,
             "tier_summary": self.tier_summary,
+            "proposed_name": self.proposed_name,
+            "proposed_tags": self.proposed_tags,
+            "ocr_full_text": self.ocr_full_text,
         }
 
 
@@ -307,17 +316,73 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
         output_path = Path(settings.output_folder) / output_filename
         layer_text_on_pdf(pdfa_tmp, ocr_results, output_path, settings.dpi)
 
-        # ---- Step 6: Mark job as done ----
-        job_manager.update_job(
-            job_id,
-            status=JobStatus.DONE,
-            finished_at=datetime.now(timezone.utc),
-            output_filename=output_filename,
-            ocr_full_text=ocr_full_text,
-            tier_summary=tier_summary,
-            tags=[],  # Populated in Sprint 2
-        )
-        logger.info(f"Job {job_id} completed: {output_filename}")
+        # ---- Step 6: Generate name & tags via LLM ----
+        # Only attempt if we have OCR text and a tagging model configured
+        if ocr_full_text and settings.tagging_model:
+            try:
+                tagging_result = await generate_name_and_tags(
+                    ocr_full_text,
+                    settings.rename_prompt,
+                    settings,
+                )
+                proposed_name = tagging_result.get("filename", file_path.stem)
+                proposed_tags = tagging_result.get("tags", [])
+            except TaggingError as exc:
+                # Tagging LLM call failed — fall back to original name, no tags
+                logger.warning(f"Job {job_id}: Tagging failed: {exc}")
+                proposed_name = file_path.stem
+                proposed_tags = []
+        else:
+            proposed_name = file_path.stem
+            proposed_tags = []
+
+        # ---- Step 7: Finalize based on AUTO_RENAME setting ----
+        if settings.auto_rename:
+            # Auto-rename: embed tags, rename file, mark done immediately
+            final_name = sanitize_filename(proposed_name)
+            final_path = Path(settings.output_folder) / final_name
+
+            # Rename the output file from temp name to LLM-generated name
+            if final_path != output_path:
+                output_path.rename(final_path)
+                output_path = final_path
+                output_filename = final_name
+
+            # Embed tags into the PDF/A XMP metadata
+            if proposed_tags:
+                embed_tags_in_pdf(output_path, proposed_tags)
+
+            job_manager.update_job(
+                job_id,
+                status=JobStatus.DONE,
+                finished_at=datetime.now(timezone.utc),
+                output_filename=output_filename,
+                ocr_full_text=ocr_full_text,
+                tier_summary=tier_summary,
+                tags=proposed_tags,
+                proposed_name=proposed_name,
+                proposed_tags=proposed_tags,
+            )
+            logger.info(
+                f"Job {job_id} completed (auto-rename): {output_filename} "
+                f"tags={proposed_tags}"
+            )
+        else:
+            # Manual approval: save with original name, pause for user approval
+            job_manager.update_job(
+                job_id,
+                status=JobStatus.AWAITING_APPROVAL,
+                output_filename=output_filename,
+                ocr_full_text=ocr_full_text,
+                tier_summary=tier_summary,
+                proposed_name=proposed_name,
+                proposed_tags=proposed_tags,
+                tags=[],
+            )
+            logger.info(
+                f"Job {job_id} awaiting approval — proposed: "
+                f"'{proposed_name}', tags={proposed_tags}"
+            )
 
     except Exception as exc:
         # Unrecoverable error — mark job as failed

@@ -59,9 +59,9 @@
          Job history table with statuses, tags, and download links
          ============================================================ -->
     <div class="tab-panel" id="panel-history">
-        <!-- Tag filter bar (functional in Sprint 2) -->
-        <div class="tag-filter" id="tag-filter" style="display: none; margin-bottom: 16px;">
-            <input type="text" class="tag-search" placeholder="Filter by tag..." style="width: 100%;" disabled>
+        <!-- Tag filter bar — filters jobs by tag name -->
+        <div id="tag-filter" style="margin-bottom: 16px;">
+            <input type="text" id="tag-search" class="tag-search" placeholder="Filter by tag..." style="width: 100%;">
         </div>
 
         <!-- Job table -->
@@ -326,23 +326,33 @@ function renderJobHistory(jobs) {
     const tbody = document.getElementById('job-tbody');
     const emptyState = document.getElementById('history-empty');
     const table = document.getElementById('job-table');
+    const tagFilter = document.getElementById('tag-filter');
+    const tagSearch = document.getElementById('tag-search');
 
     if (!jobs || jobs.length === 0) {
         table.style.display = 'none';
         emptyState.style.display = 'block';
+        tagFilter.style.display = 'none';
         return;
     }
 
     table.style.display = '';
     emptyState.style.display = 'none';
 
+    // Show tag filter if any job has tags
+    const hasAnyTags = jobs.some(j => j.tags && j.tags.length > 0);
+    tagFilter.style.display = hasAnyTags ? '' : 'none';
+
     // Update processing pulse indicator on the History tab button
     updateProcessingIndicator(jobs);
+
+    // Get the current filter text
+    const filterText = (tagSearch.value || '').toLowerCase().trim();
 
     tbody.innerHTML = jobs.map(job => {
         // Build status badge
         const statusClass = 'status-' + job.status;
-        const statusLabel = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+        const statusLabel = job.status.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
         // Build page progress text
         let pageInfo = '';
@@ -350,18 +360,29 @@ function renderJobHistory(jobs) {
             pageInfo = ` (${job.pages_done}/${job.pages})`;
         }
 
-        // Build tags display (functional in Sprint 2)
+        // Build tags display — show actual tags if done, proposed if awaiting
         let tagsHtml = '';
-        if (job.tags && job.tags.length > 0) {
-            tagsHtml = job.tags.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('');
+        const displayTags = (job.tags && job.tags.length > 0) ? job.tags : (job.proposed_tags || []);
+        if (displayTags.length > 0) {
+            const isProposed = !job.tags || job.tags.length === 0;
+            tagsHtml = displayTags.map(t =>
+                `<span class="tag${isProposed ? ' proposed' : ''}" data-tag="${escapeHtml(t).toLowerCase()}">${escapeHtml(t)}</span>`
+            ).join('');
+        } else if (job.status === 'awaiting_approval') {
+            tagsHtml = '<span style="color: var(--text-muted);font-size:0.8rem">pending</span>';
         } else {
             tagsHtml = '<span style="color: var(--text-muted)">—</span>';
         }
 
-        // Build actions column — download button only when done
+        // Build actions column
         let actionsHtml = '';
         if (job.status === 'done' && job.output_filename) {
             actionsHtml = `<a href="/api/download/${job.id}" class="btn btn-sm btn-primary" download>Download</a>`;
+        } else if (job.status === 'awaiting_approval') {
+            actionsHtml = `
+                <button class="btn btn-sm btn-primary" onclick="openPreviewModal('${job.id}')">Preview</button>
+                <button class="btn btn-sm" onclick="quickApprove('${job.id}')" style="margin-left:4px;" title="Approve with suggested name/tags">Approve</button>
+            `;
         } else if (job.status === 'failed') {
             actionsHtml = `<span class="btn btn-sm" style="cursor:default;opacity:0.5" title="${escapeHtml(job.error || '')}">Failed</span>`;
         } else {
@@ -382,8 +403,17 @@ function renderJobHistory(jobs) {
         const created = new Date(job.created_at);
         const timeStr = formatRelativeTime(created);
 
+        // Filter visibility by tag
+        let rowStyle = '';
+        if (filterText && displayTags.length > 0) {
+            const matches = displayTags.some(t => t.toLowerCase().includes(filterText));
+            if (!matches) rowStyle = 'display: none';
+        } else if (filterText && displayTags.length === 0) {
+            rowStyle = 'display: none';
+        }
+
         return `
-            <tr ${tierInfo}>
+            <tr ${tierInfo} style="${rowStyle}" class="job-row">
                 <td><strong>${escapeHtml(job.original_name)}</strong></td>
                 <td>
                     <span class="status-badge ${statusClass}">${statusLabel}</span>
@@ -454,6 +484,230 @@ function updateProcessingIndicator(jobs) {
         historyBtn.classList.add('processing');
     } else {
         historyBtn.classList.remove('processing');
+    }
+}
+
+// ---- Tag Filter ----
+// Filter job rows when the user types in the tag search input
+document.getElementById('tag-search').addEventListener('input', () => {
+    // Re-render will happen on the next poll cycle
+    // Force immediate re-render for responsiveness
+    refreshJobs();
+});
+
+// ---- Preview & Approve Modal ----
+const modalOverlay = document.getElementById('modal-overlay');
+const modalContent = document.getElementById('modal-content');
+
+// Close modal when clicking the backdrop
+modalOverlay.addEventListener('click', (e) => {
+    if (e.target === modalOverlay) closeModal();
+});
+
+function closeModal() {
+    modalOverlay.classList.remove('open');
+}
+
+// Open the preview modal for a job awaiting approval
+async function openPreviewModal(jobId) {
+    // Fetch job preview data (OCR text, proposed name, proposed tags)
+    let preview;
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/preview`);
+        if (!res.ok) {
+            showToast('Failed to load preview', 'error');
+            return;
+        }
+        preview = await res.json();
+    } catch (err) {
+        showToast('Network error loading preview', 'error');
+        return;
+    }
+
+    // Store current job ID for the approve/regenerate handlers
+    modalContent.dataset.jobId = jobId;
+
+    // Truncate OCR text for display (first 2000 chars)
+    const ocrPreview = (preview.ocr_full_text || '').substring(0, 2000);
+
+    // Build modal HTML
+    modalContent.innerHTML = `
+        <h3>Preview & Approve — ${escapeHtml(preview.proposed_name || 'Untitled')}</h3>
+
+        <label style="font-size:0.8rem;color:var(--text-secondary)">Proposed Filename</label>
+        <input type="text" id="modal-filename" class="modal-input"
+               value="${escapeHtml(preview.proposed_name || '')}"
+               style="width:100%;margin-bottom:12px;">
+
+        <label style="font-size:0.8rem;color:var(--text-secondary)">Tags</label>
+        <div id="modal-tags" class="modal-tags" style="margin-bottom:8px;"></div>
+        <div style="display:flex;gap:6px;margin-bottom:6px;">
+            <input type="text" id="modal-tag-input" class="modal-input"
+                   placeholder="Add a tag..."
+                   style="flex:1;">
+            <button class="btn btn-sm" onclick="addModalTag()">Add</button>
+        </div>
+
+        <details style="margin-top:12px;">
+            <summary style="cursor:pointer;color:var(--text-secondary);font-size:0.8rem;">
+                OCR Text Preview (first 2000 chars)
+            </summary>
+            <pre class="ocr-preview">${escapeHtml(ocrPreview)}</pre>
+        </details>
+
+        <details style="margin-top:12px;">
+            <summary style="cursor:pointer;color:var(--text-secondary);font-size:0.8rem;">
+                Custom Rename Prompt
+            </summary>
+            <textarea id="modal-regenerate-prompt" class="modal-textarea" rows="4"
+                      placeholder="Custom prompt for regenerating name/tags...">${escapeHtml(preview.regenerate_prompt || '')}</textarea>
+            <button class="btn btn-sm" onclick="regenerateName()" style="margin-top:6px;">Regenerate</button>
+        </details>
+
+        <div class="modal-actions">
+            <button class="btn" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="approveMetadata()">Approve & Finalize</button>
+        </div>
+    `;
+
+    // Populate modal tags
+    renderModalTags((preview.proposed_tags || []).slice());
+
+    modalOverlay.classList.add('open');
+}
+
+// Render tag chips in the modal
+function renderModalTags(tags) {
+    const container = document.getElementById('modal-tags');
+    if (!container) return;
+    container.innerHTML = tags.map((tag, i) => `
+        <span class="tag-chip">
+            ${escapeHtml(tag)}
+            <button class="tag-chip-remove" onclick="removeModalTag(${i})" title="Remove tag">&times;</button>
+        </span>
+    `).join('');
+}
+
+// Get current modal tags as an array
+function getModalTags() {
+    const chips = document.querySelectorAll('#modal-tags .tag-chip');
+    return Array.from(chips).map(chip => chip.textContent.replace('×', '').trim());
+}
+
+// Add a tag from the input field
+function addModalTag() {
+    const input = document.getElementById('modal-tag-input');
+    if (!input) return;
+    const tag = input.value.trim();
+    if (!tag) return;
+
+    const currentTags = getModalTags();
+    if (currentTags.length >= 5) {
+        showToast('Maximum 5 tags allowed', 'error');
+        return;
+    }
+    if (currentTags.includes(tag)) {
+        showToast('Tag already exists', 'error');
+        return;
+    }
+
+    currentTags.push(tag);
+    renderModalTags(currentTags);
+    input.value = '';
+}
+
+// Remove a tag from the modal
+function removeModalTag(index) {
+    const tags = getModalTags();
+    tags.splice(index, 1);
+    renderModalTags(tags);
+}
+
+// Approve the metadata — sends PUT to finalize the job
+async function approveMetadata() {
+    const jobId = modalContent.dataset.jobId;
+    const filename = document.getElementById('modal-filename').value.trim();
+    const tags = getModalTags();
+
+    if (!filename) {
+        showToast('Filename cannot be empty', 'error');
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/metadata`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename, tags }),
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            showToast('Failed: ' + (err.detail || res.statusText), 'error');
+            return;
+        }
+        closeModal();
+        showToast('Document finalized', 'success');
+        refreshJobs();
+    } catch (err) {
+        showToast('Network error', 'error');
+    }
+}
+
+// Regenerate name/tags with a custom prompt
+async function regenerateName() {
+    const jobId = modalContent.dataset.jobId;
+    const prompt = document.getElementById('modal-regenerate-prompt').value.trim();
+
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/rename`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            showToast('Regenerate failed: ' + (err.detail || res.statusText), 'error');
+            return;
+        }
+        const data = await res.json();
+
+        // Update modal fields
+        document.getElementById('modal-filename').value = data.proposed_name || '';
+        renderModalTags(data.proposed_tags || []);
+        showToast('Name & tags regenerated', 'success');
+    } catch (err) {
+        showToast('Network error', 'error');
+    }
+}
+
+// Quick-approve — uses the LLM-proposed values without opening the modal
+async function quickApprove(jobId) {
+    try {
+        // Get current proposed values from the job
+        const res = await fetch(`/api/jobs/${jobId}/preview`);
+        if (!res.ok) {
+            showToast('Failed to load job data', 'error');
+            return;
+        }
+        const preview = await res.json();
+
+        const metadataRes = await fetch(`/api/jobs/${jobId}/metadata`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                filename: preview.proposed_name || 'untitled',
+                tags: preview.proposed_tags || [],
+            }),
+        });
+        if (!metadataRes.ok) {
+            const err = await metadataRes.json();
+            showToast('Failed: ' + (err.detail || metadataRes.statusText), 'error');
+            return;
+        }
+        showToast('Document approved', 'success');
+        refreshJobs();
+    } catch (err) {
+        showToast('Network error', 'error');
     }
 }
 
