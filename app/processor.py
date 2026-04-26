@@ -147,14 +147,33 @@ class JobManager:
         with self._lock:
             return self._jobs.get(job_id)
 
-    def list_jobs(self) -> list[dict]:
+    def list_jobs(self, page: int = 1, per_page: int = 20) -> dict:
         """
-        Return all jobs as dicts, newest first.
+        Return paginated jobs as dicts, newest first.
+
+        Args:
+            page: Page number (1-indexed).
+            per_page: Number of jobs per page.
+
+        Returns:
+            dict with keys: jobs (list of job dicts), total (int),
+            page (int), per_page (int), pages (int).
         """
         with self._lock:
             jobs = list(self._jobs.values())
         jobs.sort(key=lambda j: j.created_at, reverse=True)
-        return [j.to_dict() for j in jobs]
+        total = len(jobs)
+        pages = max(1, (total + per_page - 1) // per_page)
+        start = (page - 1) * per_page
+        end = start + per_page
+        page_jobs = jobs[start:end]
+        return {
+            "jobs": [j.to_dict() for j in page_jobs],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": pages,
+        }
 
     def update_job(self, job_id: str, **kwargs):
         """

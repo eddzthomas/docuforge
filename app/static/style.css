@@ -540,6 +540,26 @@ header p {
     margin-bottom: 8px;
 }
 
+/* ---- Pagination ---- */
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 12px;
+    padding: 8px 0;
+}
+
+.pagination-info {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.pagination-dots {
+    padding: 4px 8px;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
 /* ---- Settings result indicators ---- */
 #test-ollama-result,
 #save-result {

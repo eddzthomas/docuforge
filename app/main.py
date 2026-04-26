@@ -211,13 +211,16 @@ async def upload_files(
 
 
 @app.get("/api/jobs")
-async def list_jobs():
+async def list_jobs(page: int = 1, per_page: int = 20):
     """
-    Return all processing jobs, newest first.
+    Return paginated processing jobs, newest first.
 
-    Used by the History tab to poll for updates every 2 seconds.
+    Query params:
+        page: Page number (1-indexed, default 1).
+        per_page: Jobs per page (default 20, max 100).
     """
-    return JSONResponse(job_manager.list_jobs())
+    per_page = min(per_page, 100)
+    return JSONResponse(job_manager.list_jobs(page=page, per_page=per_page))
 
 
 @app.get("/api/jobs/{job_id}")

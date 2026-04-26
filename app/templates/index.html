@@ -118,6 +118,9 @@
             </tbody>
         </table>
 
+        <!-- Pagination controls -->
+        <div id="pagination" class="pagination" style="display:none;"></div>
+
         <!-- Empty state shown when no jobs exist -->
         <div class="empty-state" id="history-empty">
             <span class="icon">&#128203;</span>
@@ -413,12 +416,16 @@ processBtn.addEventListener('click', async () => {
 // ---- Job Polling — Fetches job list every 2 seconds ----
 let pollInterval = null;
 
+// ---- Pagination state ----
+let currentPage = 1;
+const PER_PAGE = 15;
+
 async function refreshJobs() {
     try {
-        const res = await fetch('/api/jobs');
+        const res = await fetch(`/api/jobs?page=${currentPage}&per_page=${PER_PAGE}`);
         if (!res.ok) return;
-        const jobs = await res.json();
-        renderJobHistory(jobs);
+        const data = await res.json();
+        renderJobHistory(data);
     } catch (err) {
         console.error('Job poll error:', err);
     }
@@ -430,17 +437,23 @@ pollInterval = setInterval(refreshJobs, 2000);
 refreshJobs();
 
 // ---- Render Job History Table ----
-function renderJobHistory(jobs) {
+function renderJobHistory(data) {
     const tbody = document.getElementById('job-tbody');
     const emptyState = document.getElementById('history-empty');
     const table = document.getElementById('job-table');
     const tagFilter = document.getElementById('tag-filter');
     const tagSearch = document.getElementById('tag-search');
+    const paginationEl = document.getElementById('pagination');
+
+    const jobs = data.jobs || [];
+    const total = data.total || 0;
+    const pages = data.pages || 1;
 
     if (!jobs || jobs.length === 0) {
         table.style.display = 'none';
         emptyState.style.display = 'block';
         tagFilter.style.display = 'none';
+        if (paginationEl) paginationEl.style.display = 'none';
         return;
     }
 
@@ -455,6 +468,9 @@ function renderJobHistory(jobs) {
     updateProcessingIndicator(jobs);
     // Update batch progress bar
     updateBatchProgress(jobs);
+
+    // Render pagination
+    renderPagination(pages, total, paginationEl);
 
     // Get the current filter text
     const filterText = (tagSearch.value || '').toLowerCase().trim();
@@ -1169,6 +1185,24 @@ function toggleDetail(detailId) {
         });
     }
 }
+
+// ---- Pagination ----
+function renderPagination(pages, total, el) {
+    if (!el) return;
+    if (pages <= 1) { el.style.display = 'none'; return; }
+    el.style.display = 'flex';
+    let html = `<span class=\"pagination-info\">${total} job(s) &mdash; page ${currentPage} of ${pages}</span><div>`;
+    if (currentPage > 1) html += `<button class=\"btn btn-sm\" onclick=\"goToPage(${currentPage - 1})\">Prev</button>`;
+    for (let p = 1; p <= pages; p++) {
+        if (p === currentPage) html += `<button class=\"btn btn-sm btn-primary\">${p}</button>`;
+        else if (Math.abs(p - currentPage) <= 2 || p === 1 || p === pages) html += `<button class=\"btn btn-sm\" onclick=\"goToPage(${p})\">${p}</button>`;
+        else if (p === 2 || p === pages - 1) html += `<span class=\"pagination-dots\">...</span>`;
+    }
+    if (currentPage < pages) html += `<button class=\"btn btn-sm\" onclick=\"goToPage(${currentPage + 1})\">Next</button>`;
+    html += `</div>`;
+    el.innerHTML = html;
+}
+function goToPage(page) { currentPage = page; refreshJobs(); }
 
 // ---- Select All / Upload Options ----
 function toggleSelectAll() {
