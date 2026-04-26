@@ -377,6 +377,50 @@ header p {
 .status-dot.online  { background: var(--success); }
 .status-dot.offline { background: var(--danger); }
 
+/* ---- Button states ---- */
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ---- Processing pulse on tab button ---- */
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+.tab-btn.processing {
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+.tab-btn.processing::after {
+    content: ' ●';
+    color: var(--accent);
+    font-size: 0.6rem;
+    vertical-align: middle;
+}
+
+/* ---- Notification toast ---- */
+.toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 12px 20px;
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    font-weight: 600;
+    z-index: 200;
+    animation: fadeIn 0.3s ease, fadeOut 0.3s ease 2.7s forwards;
+    box-shadow: var(--shadow);
+}
+
+.toast.success { background: var(--success); color: #fff; }
+.toast.error   { background: var(--danger); color: #fff; }
+
+@keyframes fadeOut {
+    to { opacity: 0; transform: translateY(8px); }
+}
+
 /* ---- Modal (Sprint 2) ---- */
 .modal-overlay {
     display: none;

@@ -156,19 +156,27 @@ Document text:
      Tab switching, upload handling, job polling, status checks
      ================================================================ -->
 <script>
-// ---- Tab switching ----
-// Listen for clicks on tab buttons and show the corresponding panel
-document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-        // Deactivate all tabs and panels
-        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+// ================================================================
+// DocuForge — Frontend JavaScript
+// Tab switching, file upload, job polling, history rendering
+// ================================================================
 
-        // Activate the clicked tab and its panel
-        btn.classList.add('active');
-        const panelId = 'panel-' + btn.dataset.tab;
-        document.getElementById(panelId).classList.add('active');
-    });
+// ---- Tab Switching ----
+function switchTab(tabName) {
+    // Deactivate all tabs and panels
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+
+    // Activate the target tab and its panel
+    const btn = document.querySelector(`.tab-btn[data-tab="${tabName}"]`);
+    if (btn) btn.classList.add('active');
+    const panel = document.getElementById('panel-' + tabName);
+    if (panel) panel.classList.add('active');
+}
+
+// Listen for clicks on tab buttons
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
 
 // ---- File Upload Handling ----
@@ -246,16 +254,154 @@ function renderFileList() {
     });
 }
 
-// Process button handler (wired up in Sprint 1)
-processBtn.addEventListener('click', () => {
+// ---- Process Button — Uploads all queued files to the API ----
+processBtn.addEventListener('click', async () => {
     if (pendingFiles.length === 0) return;
-    alert('Processing will be implemented in Sprint 1. ' + pendingFiles.length + ' file(s) queued.');
+
+    // Disable button to prevent double-clicks
+    processBtn.disabled = true;
+    processBtn.textContent = 'Uploading...';
+
+    // Upload each file individually to POST /api/upload
+    let uploadedCount = 0;
+    let errorCount = 0;
+
+    for (const file of pendingFiles) {
+        const formData = new FormData();
+        formData.append('files', file);
+
+        try {
+            const res = await fetch('/api/upload', { method: 'POST', body: formData });
+            if (!res.ok) {
+                const err = await res.json();
+                console.error('Upload failed:', err.detail || res.statusText);
+                errorCount++;
+                continue;
+            }
+            uploadedCount++;
+        } catch (err) {
+            console.error('Upload error:', err);
+            errorCount++;
+        }
+    }
+
+    // Clear the file queue and reset the UI
+    pendingFiles = [];
+    renderFileList();
+    processBtn.disabled = false;
+    processBtn.textContent = 'Process Files';
+
+    // Show toast notification with upload results
+    if (uploadedCount > 0) {
+        showToast(`${uploadedCount} file(s) uploaded successfully`, 'success');
+        switchTab('history');
+        refreshJobs();
+    }
+    if (errorCount > 0) {
+        showToast(`${errorCount} file(s) failed to upload`, 'error');
+    }
 });
+
+// ---- Job Polling — Fetches job list every 2 seconds ----
+let pollInterval = null;
+
+async function refreshJobs() {
+    try {
+        const res = await fetch('/api/jobs');
+        if (!res.ok) return;
+        const jobs = await res.json();
+        renderJobHistory(jobs);
+    } catch (err) {
+        console.error('Job poll error:', err);
+    }
+}
+
+// Start polling when the page loads
+pollInterval = setInterval(refreshJobs, 2000);
+// Also run immediately
+refreshJobs();
+
+// ---- Render Job History Table ----
+function renderJobHistory(jobs) {
+    const tbody = document.getElementById('job-tbody');
+    const emptyState = document.getElementById('history-empty');
+    const table = document.getElementById('job-table');
+
+    if (!jobs || jobs.length === 0) {
+        table.style.display = 'none';
+        emptyState.style.display = 'block';
+        return;
+    }
+
+    table.style.display = '';
+    emptyState.style.display = 'none';
+
+    // Update processing pulse indicator on the History tab button
+    updateProcessingIndicator(jobs);
+
+    tbody.innerHTML = jobs.map(job => {
+        // Build status badge
+        const statusClass = 'status-' + job.status;
+        const statusLabel = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+
+        // Build page progress text
+        let pageInfo = '';
+        if (job.pages > 0) {
+            pageInfo = ` (${job.pages_done}/${job.pages})`;
+        }
+
+        // Build tags display (functional in Sprint 2)
+        let tagsHtml = '';
+        if (job.tags && job.tags.length > 0) {
+            tagsHtml = job.tags.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('');
+        } else {
+            tagsHtml = '<span style="color: var(--text-muted)">—</span>';
+        }
+
+        // Build actions column — download button only when done
+        let actionsHtml = '';
+        if (job.status === 'done' && job.output_filename) {
+            actionsHtml = `<a href="/api/download/${job.id}" class="btn btn-sm btn-primary" download>Download</a>`;
+        } else if (job.status === 'failed') {
+            actionsHtml = `<span class="btn btn-sm" style="cursor:default;opacity:0.5" title="${escapeHtml(job.error || '')}">Failed</span>`;
+        } else {
+            actionsHtml = '<span style="color: var(--text-muted);font-size:0.8rem">—</span>';
+        }
+
+        // Build tier summary tooltip
+        let tierInfo = '';
+        if (job.tier_summary && Object.keys(job.tier_summary).length > 0) {
+            const parts = [];
+            if (job.tier_summary.word) parts.push(`${job.tier_summary.word} word-level`);
+            if (job.tier_summary.line) parts.push(`${job.tier_summary.line} line-level`);
+            if (job.tier_summary.skip) parts.push(`${job.tier_summary.skip} skipped`);
+            tierInfo = `title="OCR tiers: ${parts.join(', ')}"`;
+        }
+
+        // Format date relative
+        const created = new Date(job.created_at);
+        const timeStr = formatRelativeTime(created);
+
+        return `
+            <tr ${tierInfo}>
+                <td><strong>${escapeHtml(job.original_name)}</strong></td>
+                <td>
+                    <span class="status-badge ${statusClass}">${statusLabel}</span>
+                    <span style="font-size:0.75rem;color:var(--text-muted);margin-left:6px">${pageInfo}</span>
+                </td>
+                <td>${tagsHtml}</td>
+                <td style="font-size:0.8rem;color:var(--text-secondary)">${timeStr}</td>
+                <td>${actionsHtml}</td>
+            </tr>
+        `;
+    }).join('');
+}
 
 // ---- Utility Functions ----
 
 // Sanitize user-provided text for safe HTML insertion
 function escapeHtml(text) {
+    if (!text) return '';
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
@@ -267,6 +413,48 @@ function formatSize(bytes) {
     const units = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(1024));
     return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
+}
+
+// Format a Date as relative time string (e.g., "2 min ago")
+function formatRelativeTime(date) {
+    const now = new Date();
+    const diffSec = Math.floor((now - date) / 1000);
+
+    if (diffSec < 5) return 'just now';
+    if (diffSec < 60) return `${diffSec}s ago`;
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    // Older — show date
+    return date.toLocaleDateString();
+}
+
+// ---- Toast Notification ----
+// Shows a brief popup at the bottom-right, auto-dismisses after 3 seconds
+function showToast(message, type) {
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    // Remove from DOM after the fade-out animation completes
+    setTimeout(() => {
+        if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 3000);
+}
+
+// ---- Processing Indicator ----
+// Check if any jobs are in 'processing' state and show a pulse on the History tab
+function updateProcessingIndicator(jobs) {
+    const historyBtn = document.querySelector('.tab-btn[data-tab="history"]');
+    if (!historyBtn) return;
+
+    const hasProcessing = jobs.some(j => j.status === 'processing');
+    const hasQueued = jobs.some(j => j.status === 'queued');
+
+    if (hasProcessing || hasQueued) {
+        historyBtn.classList.add('processing');
+    } else {
+        historyBtn.classList.remove('processing');
+    }
 }
 
 // ---- Health Check Polling ----
