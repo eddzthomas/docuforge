@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DocuForge — Document Processing Pipeline</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<!-- ================================================================
+     DocuForge — Single-Page Web UI
+     Three tabs: Upload, History, Settings
+     ================================================================ -->
+<div class="app-container">
+
+    <!-- ---- Header ---- -->
+    <header>
+        <h1>DocuForge</h1>
+        <p>Upload scanned PDFs &amp; images — get searchable PDF/A with OCR</p>
+    </header>
+
+    <!-- ---- Tab Navigation ---- -->
+    <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="upload">Upload</button>
+        <button class="tab-btn" data-tab="history">History</button>
+        <button class="tab-btn" data-tab="settings">Settings</button>
+    </nav>
+
+    <!-- ============================================================
+         TAB 1: Upload
+         Drag-and-drop zone + file list + process button
+         ============================================================ -->
+    <div class="tab-panel active" id="panel-upload">
+        <!-- Upload zone: click or drag files -->
+        <div class="upload-zone" id="upload-zone">
+            <span class="upload-zone-icon">&#128196;</span>
+            <h3>Drop files here or click to browse</h3>
+            <p>PDF, PNG, JPG, TIFF, BMP — up to 100 MB each</p>
+            <input type="file" id="file-input" multiple accept=".pdf,.png,.jpg,.jpeg,.tiff,.tif,.bmp">
+        </div>
+
+        <!-- List of files queued for upload -->
+        <div class="file-list" id="file-list"></div>
+
+        <!-- Process button (hidden until files are added) -->
+        <button class="btn btn-primary process-btn" id="process-btn" style="display: none;">
+            Process Files
+        </button>
+
+        <!-- Status bar shows Ollama connectivity -->
+        <div class="status-bar" id="status-bar">
+            <span class="status-dot offline" id="status-dot"></span>
+            <span id="status-text">Checking Ollama connection...</span>
+        </div>
+    </div>
+
+    <!-- ============================================================
+         TAB 2: History
+         Job history table with statuses, tags, and download links
+         ============================================================ -->
+    <div class="tab-panel" id="panel-history">
+        <!-- Tag filter bar (functional in Sprint 2) -->
+        <div class="tag-filter" id="tag-filter" style="display: none; margin-bottom: 16px;">
+            <input type="text" class="tag-search" placeholder="Filter by tag..." style="width: 100%;" disabled>
+        </div>
+
+        <!-- Job table -->
+        <table class="job-table" id="job-table">
+            <thead>
+                <tr>
+                    <th>File</th>
+                    <th>Status</th>
+                    <th>Tags</th>
+                    <th>Date</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="job-tbody">
+                <!-- Rows populated by JavaScript -->
+            </tbody>
+        </table>
+
+        <!-- Empty state shown when no jobs exist -->
+        <div class="empty-state" id="history-empty">
+            <span class="icon">&#128203;</span>
+            <p>No files processed yet. Upload something to get started.</p>
+        </div>
+    </div>
+
+    <!-- ============================================================
+         TAB 3: Settings
+         Configuration form (functional in Sprint 4)
+         ============================================================ -->
+    <div class="tab-panel" id="panel-settings">
+        <form class="settings-form" id="settings-form" onsubmit="return false;">
+            <div class="form-group">
+                <label for="cfg-ollama-host">Ollama Host</label>
+                <input type="text" id="cfg-ollama-host" value="http://ollama:11434" disabled>
+            </div>
+            <div class="form-group">
+                <label for="cfg-ocr-model">OCR Model</label>
+                <input type="text" id="cfg-ocr-model" value="glm-ocr" disabled>
+            </div>
+            <div class="form-group">
+                <label for="cfg-tagging-model">Tagging Model</label>
+                <input type="text" id="cfg-tagging-model" value="llama3.2" disabled>
+            </div>
+            <div class="form-group">
+                <label for="cfg-dpi">Render DPI</label>
+                <input type="number" id="cfg-dpi" value="300" min="72" max="600" disabled>
+            </div>
+            <div class="form-group">
+                <label for="cfg-pdfa-level">PDF/A Level</label>
+                <select id="cfg-pdfa-level" disabled>
+                    <option value="2b">PDF/A-2b</option>
+                    <option value="3b">PDF/A-3b</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="cfg-auto-rename">Auto-rename</label>
+                <select id="cfg-auto-rename" disabled>
+                    <option value="false">Off (manual approval)</option>
+                    <option value="true">On (auto-apply)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="cfg-rename-prompt">Rename Prompt Template</label>
+                <textarea id="cfg-rename-prompt" rows="6" disabled>
+You are a document archivist. Given the following OCR'd text, suggest:
+1. A concise filename (max 150 chars). Use underscores.
+2. Up to 5 tags for type, parties, subject, year.
+
+Return JSON: {"filename": "...", "tags": [...]}
+
+Document text:
+{ocr_text}
+                </textarea>
+            </div>
+            <button type="submit" class="btn btn-primary" disabled>
+                Save Settings (coming in Sprint 4)
+            </button>
+        </form>
+    </div>
+
+    <!-- ---- Modal container (Sprint 2 — Preview & Approve) ---- -->
+    <div class="modal-overlay" id="modal-overlay">
+        <div class="modal" id="modal-content">
+            <!-- Filled by JS -->
+        </div>
+    </div>
+
+</div>
+
+<!-- ================================================================
+     JavaScript
+     Tab switching, upload handling, job polling, status checks
+     ================================================================ -->
+<script>
+// ---- Tab switching ----
+// Listen for clicks on tab buttons and show the corresponding panel
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        // Deactivate all tabs and panels
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+
+        // Activate the clicked tab and its panel
+        btn.classList.add('active');
+        const panelId = 'panel-' + btn.dataset.tab;
+        document.getElementById(panelId).classList.add('active');
+    });
+});
+
+// ---- File Upload Handling ----
+const uploadZone = document.getElementById('upload-zone');
+const fileInput = document.getElementById('file-input');
+const fileList = document.getElementById('file-list');
+const processBtn = document.getElementById('process-btn');
+
+// Holds the File objects selected by the user
+let pendingFiles = [];
+
+// Click on upload zone triggers file input
+uploadZone.addEventListener('click', () => fileInput.click());
+
+// Prevent default drag behaviors to allow drop
+['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+    uploadZone.addEventListener(eventName, e => { e.preventDefault(); e.stopPropagation(); });
+});
+
+// Highlight the drop zone when files are dragged over it
+['dragenter', 'dragover'].forEach(eventName => {
+    uploadZone.addEventListener(eventName, () => uploadZone.classList.add('drag-over'));
+});
+['dragleave', 'drop'].forEach(eventName => {
+    uploadZone.addEventListener(eventName, () => uploadZone.classList.remove('drag-over'));
+});
+
+// Handle file drop
+uploadZone.addEventListener('drop', e => {
+    addFiles(Array.from(e.dataTransfer.files));
+});
+
+// Handle file selection via browse dialog
+fileInput.addEventListener('change', () => {
+    addFiles(Array.from(fileInput.files));
+    fileInput.value = ''; // Reset so re-selecting the same file works
+});
+
+// Add files to the pending list and render the UI
+function addFiles(newFiles) {
+    newFiles.forEach(file => {
+        // Avoid duplicates by filename + size
+        if (!pendingFiles.some(f => f.name === file.name && f.size === file.size)) {
+            pendingFiles.push(file);
+        }
+    });
+    renderFileList();
+}
+
+// Render the file list with remove buttons
+function renderFileList() {
+    fileList.innerHTML = '';
+    pendingFiles.forEach((file, index) => {
+        const item = document.createElement('div');
+        item.className = 'file-item';
+        item.innerHTML = `
+            <span class="name">${escapeHtml(file.name)}</span>
+            <span class="size">${formatSize(file.size)}</span>
+            <button class="remove-btn" data-index="${index}" title="Remove">&times;</button>
+        `;
+        fileList.appendChild(item);
+    });
+
+    // Show/hide process button
+    processBtn.style.display = pendingFiles.length > 0 ? 'inline-flex' : 'none';
+
+    // Wire up remove buttons
+    fileList.querySelectorAll('.remove-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const idx = parseInt(btn.dataset.index);
+            pendingFiles.splice(idx, 1);
+            renderFileList();
+        });
+    });
+}
+
+// Process button handler (wired up in Sprint 1)
+processBtn.addEventListener('click', () => {
+    if (pendingFiles.length === 0) return;
+    alert('Processing will be implemented in Sprint 1. ' + pendingFiles.length + ' file(s) queued.');
+});
+
+// ---- Utility Functions ----
+
+// Sanitize user-provided text for safe HTML insertion
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Format bytes into human-readable size
+function formatSize(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
+}
+
+// ---- Health Check Polling ----
+// Poll the health endpoint every 10 seconds to show Ollama connectivity
+async function checkHealth() {
+    try {
+        const res = await fetch('/api/health');
+        const data = await res.json();
+        const dot = document.getElementById('status-dot');
+        const text = document.getElementById('status-text');
+
+        if (data.ollama === 'connected') {
+            dot.className = 'status-dot online';
+            text.textContent = 'Ollama connected';
+        } else {
+            dot.className = 'status-dot offline';
+            text.textContent = 'Ollama disconnected — OCR unavailable';
+        }
+    } catch (err) {
+        const dot = document.getElementById('status-dot');
+        dot.className = 'status-dot offline';
+        document.getElementById('status-text').textContent = 'App error — check logs';
+    }
+}
+
+// Check immediately, then every 10 seconds
+checkHealth();
+setInterval(checkHealth, 10000);
+</script>
+</body>
+</html>

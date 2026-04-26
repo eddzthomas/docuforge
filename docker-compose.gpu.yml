@@ -1,0 +1,20 @@
+# DocuForge — GPU override for NVIDIA GPUs
+# ============================================================
+# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+#
+# Requires: NVIDIA Container Toolkit installed on host
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+
+version: "3.9"
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Alternative for older Docker versions:
+    # runtime: nvidia

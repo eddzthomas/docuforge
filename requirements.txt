@@ -1,0 +1,30 @@
+# DocuForge — Python dependencies
+# ============================================================
+
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# PDF processing
+pikepdf>=9.0.0        # PDF/A conversion, XMP metadata injection
+pypdf>=5.0.0           # Text layer placement on PDF pages
+img2pdf>=0.5.1         # Lossless image-to-PDF conversion
+pdf2image>=1.17.0      # Render PDF pages to PNG images
+Pillow>=10.0.0         # Image manipulation (underlies pdf2image)
+
+# HTTP client (for Ollama API calls)
+httpx>=0.27.0
+
+# Config & env
+python-dotenv>=1.0.0
+pydantic-settings>=2.0.0
+
+# File watching (Sprint 3)
+watchfiles>=0.24.0
+
+# Templates
+jinja2>=3.1.0
+
+# UUID generation for job IDs
+uuid6>=2024.0.0

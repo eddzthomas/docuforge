@@ -1,0 +1,35 @@
+# Git
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment secrets
+.env
+*.env.local
+
+# Data volumes (mounted at runtime)
+data/uploads/
+data/output/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs
+*.md
+!README.md
+
+# Docker
+.docker/
+docker-compose*.yml
+Dockerfile
+.dockerignore
