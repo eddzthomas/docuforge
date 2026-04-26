@@ -8,10 +8,12 @@ JobManager tracks all jobs in memory with thread-safe access.
 process_file() is called as a background task from the API route.
 """
 
+import asyncio
 import logging
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -402,3 +404,209 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 shutil.rmtree(job_tmp, ignore_errors=True)
         except Exception:
             logger.debug(f"Failed to clean up temp dir: {job_tmp}")
+
+
+# =============================================================================
+# Sprint 3: Job Queue + Folder Watcher
+# =============================================================================
+
+
+class JobQueue:
+    """
+    Async job queue that serializes document processing.
+
+    Uses asyncio.Queue as a FIFO buffer and a semaphore to limit
+    concurrent processing (default: 1). This prevents hammering
+    Ollama with multiple simultaneous OCR calls.
+
+    Replaces the ad-hoc BackgroundTasks.add_task approach from
+    Sprint 1. All jobs (from uploads and folder watcher) flow
+    through this queue.
+    """
+
+    def __init__(self, max_concurrency: int = 1):
+        self._queue: asyncio.Queue[tuple[str, Path]] = asyncio.Queue()
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._worker_task: Optional[asyncio.Task] = None
+        self._running = False
+
+    def enqueue(self, job_id: str, file_path: Path):
+        """
+        Add a job to the processing queue.
+
+        The queue worker will pick it up and call process_file()
+        when a processing slot opens. Jobs wait in queued status
+        until the worker begins them.
+        """
+        self._queue.put_nowait((job_id, file_path))
+        logger.debug(f"Job {job_id} enqueued — queue size: {self._queue.qsize()}")
+
+    @property
+    def queue_size(self) -> int:
+        """Return the number of jobs waiting in the queue."""
+        return self._queue.qsize()
+
+    async def worker(self):
+        """
+        Continuous loop that pops jobs from the queue and processes them.
+
+        The semaphore limits concurrency. With max_concurrency=1,
+        jobs are processed strictly one at a time. When no jobs are
+        queued, the worker sleeps on the queue's async get().
+        """
+        self._running = True
+        logger.info(f"Job queue worker started (max concurrency={self._semaphore._value})")
+
+        while self._running:
+            # Wait for the next job — this blocks until a job is enqueued
+            job_id, file_path = await self._queue.get()
+
+            # Check for shutdown sentinel
+            if job_id == "__SHUTDOWN__":
+                logger.info("Queue worker received shutdown sentinel")
+                self._queue.task_done()
+                break
+
+            # Acquire a processing slot (respects max concurrency)
+            async with self._semaphore:
+                logger.info(f"Queue worker: starting job {job_id}")
+                await process_file(job_id, file_path)
+                logger.info(f"Queue worker: completed job {job_id}")
+
+            self._queue.task_done()
+
+        logger.info("Job queue worker stopped")
+
+    def stop(self):
+        """Signal the worker to stop after the current job finishes."""
+        self._running = False
+        # Put a sentinel to unblock the queue if it's empty
+        try:
+            self._queue.put_nowait(("__SHUTDOWN__", Path("/dev/null")))
+        except Exception:
+            pass
+
+
+# ---- Singleton queue ----
+job_queue = JobQueue(max_concurrency=1)
+
+# ---- Folder Watcher ----
+_watcher_task: Optional[asyncio.Task] = None
+_watcher_running = False
+_watcher_files_seen = 0  # Counter for UI display
+
+
+async def watch_folder():
+    """
+    Monitor the upload folder for new files and auto-enqueue them.
+
+    Uses watchfiles.awatch() which yields filesystem change events.
+    When a new file is created in the upload folder, the watcher:
+      1. Validates the file extension against allowed types
+      2. Waits a short debounce period (to handle partial network writes)
+      3. Creates a job via job_manager
+      4. Enqueues the job into the job_queue
+
+    The watcher runs as a long-lived asyncio task, toggled on/off
+    via the /api/watcher endpoints.
+    """
+    global _watcher_running, _watcher_files_seen
+    _watcher_running = True
+    _watcher_files_seen = 0
+
+    settings = get_settings()
+    upload_dir = Path(settings.upload_folder)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Folder watcher started — watching: {upload_dir}")
+
+    try:
+        from watchfiles import awatch
+    except ImportError:
+        logger.error("watchfiles not installed — folder watcher unavailable")
+        _watcher_running = False
+        return
+
+    try:
+        async for changes in awatch(str(upload_dir)):
+            if not _watcher_running:
+                break
+
+            for change_type, changed_path in changes:
+                # We only care about newly created or modified files
+                if change_type not in (1, 2):  # 1=added, 2=modified
+                    continue
+
+                changed = Path(changed_path)
+                suffix = changed.suffix.lower()
+
+                # Skip non-file entries and unsupported types
+                if not changed.is_file():
+                    continue
+                if suffix not in IMAGE_SUFFIXES and suffix != ".pdf":
+                    continue
+                # Skip temp/interim files from our own processing
+                if "_interim" in changed.name or "_page_" in changed.name:
+                    continue
+
+                # Debounce: wait a moment for the file write to finish
+                await asyncio.sleep(settings.watch_interval * 0.1)
+
+                # Verify the file still exists and has size > 0
+                if not changed.exists() or changed.stat().st_size == 0:
+                    continue
+
+                # Create and enqueue the job
+                job = job_manager.create_job(changed.name)
+                job_queue.enqueue(job.id, changed)
+                _watcher_files_seen += 1
+
+                logger.info(f"Watcher: auto-enqueued {changed.name} → job {job.id}")
+
+    except asyncio.CancelledError:
+        logger.info("Folder watcher task cancelled")
+    except Exception:
+        logger.exception("Folder watcher encountered an error")
+    finally:
+        _watcher_running = False
+        logger.info(f"Folder watcher stopped. Total files seen: {_watcher_files_seen}")
+
+
+def get_watcher_status() -> dict:
+    """Return the current state of the folder watcher for the API."""
+    return {
+        "running": _watcher_running,
+        "watching_path": str(Path(get_settings().upload_folder)),
+        "files_seen": _watcher_files_seen,
+    }
+
+
+async def start_watcher():
+    """Start the folder watcher as a background asyncio task."""
+    global _watcher_task, _watcher_running
+    if _watcher_running:
+        logger.info("Folder watcher is already running")
+        return {"status": "already_running"}
+
+    _watcher_task = asyncio.create_task(watch_folder())
+    # Give it a moment to start
+    await asyncio.sleep(0.1)
+    return {"status": "started"}
+
+
+async def stop_watcher():
+    """Stop the folder watcher background task."""
+    global _watcher_task, _watcher_running
+    if not _watcher_running:
+        logger.info("Folder watcher is not running")
+        return {"status": "not_running"}
+
+    _watcher_running = False
+    if _watcher_task:
+        _watcher_task.cancel()
+        try:
+            await _watcher_task
+        except asyncio.CancelledError:
+            pass
+        _watcher_task = None
+    return {"status": "stopped"}

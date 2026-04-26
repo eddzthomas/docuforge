@@ -8,20 +8,28 @@ Defines routes, mounts static files, and serves the UI.
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.background import BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from app.config import get_settings
-from app.processor import job_manager, process_file, JobStatus
+from app.processor import (
+    job_manager,
+    job_queue,
+    process_file,
+    JobStatus,
+    start_watcher,
+    stop_watcher,
+    get_watcher_status,
+)
 from app.tagger import generate_name_and_tags, sanitize_filename, TaggingError
 from app.pdf_utils import embed_tags_in_pdf
 
@@ -31,16 +39,49 @@ logger = logging.getLogger(__name__)
 # Load settings once at startup via cached singleton
 settings = get_settings()
 
+# ---- Lifespan — starts queue worker on app boot, stops on shutdown ----
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifecycle manager.
+
+    On startup:
+      - Ensure data directories exist
+      - Start the job queue worker (processes files one at a time)
+
+    On shutdown:
+      - Stop the queue worker
+      - Stop the folder watcher if running
+    """
+    # Startup
+    settings = get_settings()
+    Path(settings.upload_folder).mkdir(parents=True, exist_ok=True)
+    Path(settings.output_folder).mkdir(parents=True, exist_ok=True)
+
+    # Start the queue worker as a background task
+    worker_task = asyncio.create_task(job_queue.worker())
+    logger.info("Job queue worker started via lifespan")
+
+    yield  # App runs here
+
+    # Shutdown
+    logger.info("Shutting down — stopping queue worker and watcher")
+    job_queue.stop()
+    await stop_watcher()
+    # Wait for the worker to drain and stop naturally via sentinel
+    try:
+        await asyncio.wait_for(worker_task, timeout=30.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
+
 # FastAPI app with metadata for OpenAPI docs
 app = FastAPI(
     title="DocuForge",
     description="Intelligent Document Processing Pipeline — PDF/A + OCR + Tagging",
-    version="1.0.0",
+    version="1.0.1",
+    lifespan=lifespan,
 )
-
-# Ensure data directories exist at startup
-Path(get_settings().upload_folder).mkdir(parents=True, exist_ok=True)
-Path(get_settings().output_folder).mkdir(parents=True, exist_ok=True)
 
 # Mount static files at /static so CSS/JS are served
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
@@ -96,15 +137,14 @@ async def health_check():
 
 @app.post("/api/upload")
 async def upload_files(
-    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
 ):
     """
     Accept one or more files for processing.
 
     Validates file extension and size, saves to the upload folder,
-    creates a job for each file, and schedules processing as a
-    background task.
+    creates a job for each file, and enqueues it into the job queue.
+    Jobs are processed one at a time by the queue worker.
 
     Returns a list of created job summaries.
     """
@@ -139,15 +179,17 @@ async def upload_files(
         file_path.write_bytes(content)
         logger.info(f"File saved: {file_path}")
 
-        # Create a processing job
+        # Create a processing job and enqueue it
+        # The queue worker picks it up and calls process_file()
         job = job_manager.create_job(file.filename)
-
-        # Schedule the pipeline as an async background task
-        background_tasks.add_task(process_file, job.id, file_path, settings)
+        job_queue.enqueue(job.id, file_path)
 
         jobs_created.append(job.to_dict())
 
-    return JSONResponse({"jobs": jobs_created})
+    return JSONResponse({
+        "jobs": jobs_created,
+        "queue_size": job_queue.queue_size,
+    })
 
 
 @app.get("/api/jobs")
@@ -427,6 +469,42 @@ async def list_tags():
     return JSONResponse([
         {"tag": tag, "count": count} for tag, count in sorted_tags
     ])
+
+
+# =============================================================================
+# Sprint 3: Folder Watcher
+# =============================================================================
+
+
+@app.get("/api/watcher/status")
+async def watcher_status():
+    """
+    Return whether the folder watcher is running and its current stats.
+    """
+    return JSONResponse(get_watcher_status())
+
+
+@app.post("/api/watcher/start")
+async def watcher_start():
+    """
+    Start monitoring the upload folder for new files.
+
+    When a compatible file (PDF/image) appears in the upload folder,
+    it is automatically enqueued for processing.
+    """
+    result = await start_watcher()
+    return JSONResponse(result)
+
+
+@app.post("/api/watcher/stop")
+async def watcher_stop():
+    """
+    Stop the folder watcher.
+
+    Files can still be uploaded via the web UI.
+    """
+    result = await stop_watcher()
+    return JSONResponse(result)
 
 
 # =============================================================================

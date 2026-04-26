@@ -47,6 +47,19 @@
             Process Files
         </button>
 
+        <!-- Folder Watcher toggle & status -->
+        <div class="watcher-bar" id="watcher-bar">
+            <div class="watcher-toggle">
+                <span class="watcher-label">Folder Watcher:</span>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="watcher-checkbox" onchange="toggleWatcher()">
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="watcher-status" id="watcher-status-text">Off</span>
+                <span class="watcher-count" id="watcher-count" style="display:none;"></span>
+            </div>
+        </div>
+
         <!-- Status bar shows Ollama connectivity -->
         <div class="status-bar" id="status-bar">
             <span class="status-dot offline" id="status-dot"></span>
@@ -60,8 +73,16 @@
          ============================================================ -->
     <div class="tab-panel" id="panel-history">
         <!-- Tag filter bar — filters jobs by tag name -->
-        <div id="tag-filter" style="margin-bottom: 16px;">
-            <input type="text" id="tag-search" class="tag-search" placeholder="Filter by tag..." style="width: 100%;">
+        <div id="tag-filter" style="margin-bottom:16px;">
+            <input type="text" id="tag-search" class="tag-search" placeholder="Filter by tag..." style="width:100%;">
+        </div>
+
+        <!-- Batch progress bar — shown when multiple jobs are queued/processing -->
+        <div id="batch-progress" style="display:none;margin-bottom:16px;">
+            <div class="batch-summary" id="batch-summary"></div>
+            <div class="batch-bar-track">
+                <div class="batch-bar-fill" id="batch-bar-fill" style="width:0%"></div>
+            </div>
         </div>
 
         <!-- Job table -->
@@ -345,6 +366,8 @@ function renderJobHistory(jobs) {
 
     // Update processing pulse indicator on the History tab button
     updateProcessingIndicator(jobs);
+    // Update batch progress bar
+    updateBatchProgress(jobs);
 
     // Get the current filter text
     const filterText = (tagSearch.value || '').toLowerCase().trim();
@@ -485,6 +508,97 @@ function updateProcessingIndicator(jobs) {
     } else {
         historyBtn.classList.remove('processing');
     }
+}
+
+// ---- Batch Progress Bar ----
+// Calculates and renders a progress bar when multiple jobs are queued/processing
+function updateBatchProgress(jobs) {
+    const batchDiv = document.getElementById('batch-progress');
+    const summaryEl = document.getElementById('batch-summary');
+    const fillEl = document.getElementById('batch-bar-fill');
+
+    if (!jobs || jobs.length === 0) {
+        batchDiv.style.display = 'none';
+        return;
+    }
+
+    // Count jobs by status
+    const done = jobs.filter(j => j.status === 'done' || j.status === 'awaiting_approval').length;
+    const processing = jobs.filter(j => j.status === 'processing').length;
+    const queued = jobs.filter(j => j.status === 'queued').length;
+    const total = queued + processing + done;
+
+    if (total <= 1) {
+        batchDiv.style.display = 'none';
+        return;
+    }
+
+    batchDiv.style.display = '';
+    const percent = Math.round((done / total) * 100);
+    summaryEl.textContent = `${done} of ${total} files complete`;
+    fillEl.style.width = percent + '%';
+}
+
+// ---- Folder Watcher ----
+// Polls watcher status and updates the toggle/indicators
+async function checkWatcherStatus() {
+    try {
+        const res = await fetch('/api/watcher/status');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const checkbox = document.getElementById('watcher-checkbox');
+        const statusText = document.getElementById('watcher-status-text');
+        const countEl = document.getElementById('watcher-count');
+
+        if (checkbox) checkbox.checked = data.running;
+        if (statusText) {
+            statusText.textContent = data.running ? 'On — watching' : 'Off';
+            statusText.style.color = data.running ? 'var(--success)' : 'var(--text-muted)';
+        }
+        if (countEl && data.files_seen > 0) {
+            countEl.style.display = '';
+            countEl.textContent = `${data.files_seen} file(s) detected`;
+        } else if (countEl) {
+            countEl.style.display = 'none';
+        }
+    } catch (err) {
+        console.error('Watcher status error:', err);
+    }
+}
+
+async function toggleWatcher() {
+    const checkbox = document.getElementById('watcher-checkbox');
+    if (!checkbox) return;
+
+    if (checkbox.checked) {
+        try {
+            const res = await fetch('/api/watcher/start', { method: 'POST' });
+            if (!res.ok) {
+                checkbox.checked = false;
+                showToast('Failed to start watcher', 'error');
+                return;
+            }
+            showToast('Folder watcher started', 'success');
+        } catch (err) {
+            checkbox.checked = false;
+            showToast('Network error', 'error');
+        }
+    } else {
+        try {
+            const res = await fetch('/api/watcher/stop', { method: 'POST' });
+            if (!res.ok) {
+                checkbox.checked = true;
+                showToast('Failed to stop watcher', 'error');
+                return;
+            }
+            showToast('Folder watcher stopped', 'success');
+        } catch (err) {
+            checkbox.checked = true;
+            showToast('Network error', 'error');
+        }
+    }
+    checkWatcherStatus();
 }
 
 // ---- Tag Filter ----
@@ -737,6 +851,10 @@ async function checkHealth() {
 // Check immediately, then every 10 seconds
 checkHealth();
 setInterval(checkHealth, 10000);
+
+// Watcher status poll — every 5 seconds
+checkWatcherStatus();
+setInterval(checkWatcherStatus, 5000);
 </script>
 </body>
 </html>
