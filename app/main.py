@@ -36,6 +36,8 @@ from app.processor import (
     start_watcher,
     stop_watcher,
     get_watcher_status,
+    log_event,
+    get_recent_events,
 )
 from app.tagger import generate_filename, generate_tags, sanitize_filename, TaggingError
 from app.pdf_utils import embed_tags_in_pdf
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
 
     # Start the queue worker as a background task
     worker_task = asyncio.create_task(job_queue.worker())
+    log_event("info", "DocuForge started, queue worker running")
     logger.info("Job queue worker started via lifespan")
 
     yield  # App runs here
@@ -197,6 +200,7 @@ async def upload_files(
             skip_tags=do_skip_tags,
         )
         job_queue.enqueue(job.id, file_path)
+        log_event("info", f"File queued: {file.filename}", job.id)
 
         jobs_created.append(job.to_dict())
 
@@ -455,6 +459,7 @@ async def update_metadata(job_id: str, body: MetadataRequest):
         proposed_name=body.filename,
         proposed_tags=cleaned_tags,
     )
+    log_event("info", f"Document approved: {final_name}", job_id)
 
     return JSONResponse(job_manager.get_job(job_id).to_dict())
 
@@ -560,6 +565,8 @@ async def watcher_start():
     it is automatically enqueued for processing.
     """
     result = await start_watcher()
+    if result.get("status") == "started":
+        log_event("info", "Folder watcher started")
     return JSONResponse(result)
 
 
@@ -571,6 +578,8 @@ async def watcher_stop():
     Files can still be uploaded via the web UI.
     """
     result = await stop_watcher()
+    if result.get("status") == "stopped":
+        log_event("info", "Folder watcher stopped")
     return JSONResponse(result)
 
 
@@ -672,3 +681,19 @@ async def test_ollama_connection():
         result["error"] = str(exc)[:300]
 
     return JSONResponse(result)
+
+
+# =============================================================================
+# Sprint 7: Logs
+# =============================================================================
+
+
+@app.get("/api/logs")
+async def get_logs(limit: int = 100):
+    """
+    Return recent application events, newest first.
+
+    Query params:
+        limit: Max number of events to return (default 100).
+    """
+    return JSONResponse(get_recent_events(limit=min(limit, 500)))

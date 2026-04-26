@@ -23,6 +23,7 @@
     <nav class="tab-nav">
         <button class="tab-btn active" data-tab="upload">Upload</button>
         <button class="tab-btn" data-tab="history">History</button>
+        <button class="tab-btn" data-tab="logs">Logs</button>
         <button class="tab-btn" data-tab="settings">Settings</button>
     </nav>
 
@@ -125,7 +126,24 @@
     </div>
 
     <!-- ============================================================
-         TAB 3: Settings
+         TAB 3: Logs
+         Recent application events
+         ============================================================ -->
+    <div class="tab-panel" id="panel-logs">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <span style="font-weight:600;">Application Logs</span>
+            <button class="btn btn-sm" onclick="refreshLogs()">Refresh</button>
+        </div>
+        <div class="log-list" id="log-list">
+            <div class="empty-state" id="logs-empty">
+                <span class="icon">&#128220;</span>
+                <p>No events yet. Process a document to see logs.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================
+         TAB 4: Settings
          Configuration form — loads from API, saves to persistent JSON
          ============================================================ -->
     <div class="tab-panel" id="panel-settings">
@@ -240,6 +258,9 @@ function switchTab(tabName) {
     }
     if (tabName === 'history') {
         loadOutputPath();
+    }
+    if (tabName === 'logs') {
+        refreshLogs();
     }
 }
 
@@ -443,10 +464,15 @@ function renderJobHistory(jobs) {
         const statusClass = 'status-' + job.status;
         const statusLabel = job.status.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
-        // Build page progress text
-        let pageInfo = '';
-        if (job.pages > 0) {
-            pageInfo = ` (${job.pages_done}/${job.pages})`;
+        // Build page progress bar
+        let progressHtml = '';
+        if (job.pages > 0 && (job.status === 'processing' || job.status === 'queued')) {
+            const pct = Math.round((job.pages_done / job.pages) * 100);
+            progressHtml = `
+                <div class="job-progress">
+                    <div class="job-progress-bar" style="width:${pct}%"></div>
+                    <span class="job-progress-text">${job.pages_done}/${job.pages} pages</span>
+                </div>`;
         }
 
         // Build tags display — show actual tags if done, proposed if awaiting
@@ -581,7 +607,7 @@ function renderJobHistory(jobs) {
                 <td><strong>${escapeHtml(job.original_name)}</strong></td>
                 <td>
                     <span class="status-badge ${statusClass}">${statusLabel}</span>
-                    <span style="font-size:0.75rem;color:var(--text-muted);margin-left:6px">${pageInfo}</span>
+                    ${progressHtml}
                 </td>
                 <td>${tagsHtml}</td>
                 <td style="font-size:0.8rem;color:var(--text-secondary)">${timeStr}</td>
@@ -1161,6 +1187,37 @@ function openPdfViewer(jobId, filename) {
 function closePdfViewer() {
     document.getElementById('pdf-viewer-overlay').style.display = 'none';
     document.getElementById('pdf-viewer-iframe').src = '';
+}
+
+// ---- Logs ----
+async function refreshLogs() {
+    try {
+        const res = await fetch('/api/logs?limit=200');
+        if (!res.ok) return;
+        const events = await res.json();
+        renderLogs(events);
+    } catch (err) {
+        console.error('Log fetch error:', err);
+    }
+}
+
+function renderLogs(events) {
+    const container = document.getElementById('log-list');
+    const emptyState = document.getElementById('logs-empty');
+    if (!events || events.length === 0) {
+        if (emptyState) emptyState.style.display = '';
+        return;
+    }
+    if (emptyState) emptyState.style.display = 'none';
+    container.innerHTML = events.map(e => {
+        const time = new Date(e.timestamp).toLocaleTimeString();
+        const jobTag = e.job_id ? `<span style="color:var(--text-muted);font-size:0.65rem;">[${e.job_id.substring(0, 8)}]</span>` : '';
+        return `<div class="log-entry">
+            <span class="log-time">${time}</span>
+            <span class="log-level ${e.level}">${e.level}</span>
+            <span class="log-msg">${jobTag} ${escapeHtml(e.message)}</span>
+        </div>`;
+    }).join('');
 }
 
 // ---- Health Check Polling ----

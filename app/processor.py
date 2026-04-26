@@ -256,6 +256,7 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
 
     # Mark job as processing
     job_manager.update_job(job_id, status=JobStatus.PROCESSING)
+    log_event("info", f"Processing started: {file_path.name}", job_id)
 
     logger.info(f"Starting pipeline for job {job_id}: {file_path.name}")
 
@@ -383,10 +384,7 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 page_errors=page_errors,
                 pdfa_saved=True,
             )
-            logger.info(
-                f"Job {job_id} completed (auto-rename): {output_filename} "
-                f"tags={proposed_tags}"
-            )
+            log_event("info", f"Completed: {output_filename}", job_id)
         else:
             # Manual approval: save with original name, pause for user approval
             job_manager.update_job(
@@ -401,15 +399,13 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 page_errors=page_errors,
                 pdfa_saved=True,
             )
-            logger.info(
-                f"Job {job_id} awaiting approval — proposed: "
-                f"'{proposed_name}', tags={proposed_tags}"
-            )
+            log_event("info", f"Awaiting approval: {file_path.stem}", job_id)
 
     except Exception as exc:
         # Unrecoverable error — mark job as failed
         error_msg = f"{type(exc).__name__}: {exc}"
         logger.error(f"Job {job_id} failed: {error_msg}", exc_info=True)
+        log_event("error", f"Failed: {error_msg}", job_id)
 
         # Save partial output if PDF/A conversion succeeded
         partial_output = None
@@ -648,3 +644,39 @@ async def stop_watcher():
             pass
         _watcher_task = None
     return {"status": "stopped"}
+
+
+# =============================================================================
+# Sprint 7: Event Logger
+# =============================================================================
+
+from collections import deque
+
+_event_log: deque[dict] = deque(maxlen=500)  # Ring buffer, latest 500 events
+
+
+def log_event(level: str, message: str, job_id: str | None = None):
+    """
+    Record a timestamped event in the in-memory ring buffer.
+
+    Args:
+        level: "info", "warn", or "error"
+        message: Human-readable event description
+        job_id: Optional associated job ID
+    """
+    _event_log.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "message": message,
+        "job_id": job_id,
+    })
+    # Also emit to the standard logger for container logs
+    log_fn = getattr(logger, level, logger.info)
+    log_fn(message)
+
+
+def get_recent_events(limit: int = 100) -> list[dict]:
+    """Return the most recent events, newest first."""
+    events = list(_event_log)
+    events.reverse()
+    return events[:limit]
