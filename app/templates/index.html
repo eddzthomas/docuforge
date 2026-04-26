@@ -417,17 +417,91 @@ function renderJobHistory(jobs) {
                 <button class="btn btn-sm" onclick="quickApprove('${job.id}')" style="margin-left:4px;" title="Approve with suggested name/tags">Approve</button>
             `;
         } else if (job.status === 'failed') {
-            actionsHtml = `<span class="btn btn-sm" style="cursor:default;opacity:0.5" title="${escapeHtml(job.error || '')}">Failed</span>`;
+            // Build error detail row ID for toggling
+            const detailId = `detail-${job.id}`;
+            let btns = `<button class="btn btn-sm btn-primary" onclick="retryJob('${job.id}')">Retry</button>`;
+            btns += ` <button class="btn btn-sm expand-btn" onclick="toggleDetail('${detailId}')" title="Show error details">Details</button>`;
+            // Partial download if PDF/A was saved
+            if (job.output_filename && job.pdfa_saved) {
+                btns += ` <a href="/api/download/${job.id}" class="btn btn-sm" download style="margin-left:4px;">Download partial</a>`;
+            }
+
+            // Build the hidden detail row HTML
+            let detailHtml = '';
+            detailHtml += `<div class="error-detail"><strong>Error:</strong> ${escapeHtml(job.error || 'Unknown error')}</div>`;
+
+            // Per-page errors
+            if (job.page_errors && job.page_errors.length > 0) {
+                detailHtml += '<div class="error-pages"><strong>Page failures:</strong><ul>';
+                job.page_errors.forEach(pe => {
+                    detailHtml += `<li>Page ${pe.page}: ${escapeHtml(pe.error)}</li>`;
+                });
+                detailHtml += '</ul></div>';
+            }
+
+            // Tier summary if available
+            if (job.tier_summary && Object.keys(job.tier_summary).some(k => job.tier_summary[k] > 0)) {
+                const tiers = [];
+                if (job.tier_summary.word) tiers.push(`${job.tier_summary.word} word-level`);
+                if (job.tier_summary.line) tiers.push(`${job.tier_summary.line} line-level`);
+                if (job.tier_summary.full_page) tiers.push(`${job.tier_summary.full_page} full-page`);
+                if (job.tier_summary.skip) tiers.push(`${job.tier_summary.skip} skipped`);
+                detailHtml += `<div class="error-tiers">OCR tiers: ${tiers.join(', ')}</div>`;
+            }
+
+            // Duration
+            if (job.finished_at && job.created_at) {
+                const duration = Math.round((new Date(job.finished_at) - new Date(job.created_at)) / 1000);
+                detailHtml += `<div class="error-duration">Duration: ${duration}s</div>`;
+            }
+
+            const detailRow = `
+                <tr class="detail-row" id="${detailId}" style="display:none;">
+                    <td colspan="5">${detailHtml}</td>
+                </tr>
+            `;
+            actionsHtml = btns;
+            // Store detail row to render after the main row
+            job._detailRow = detailRow;
         } else {
             actionsHtml = '<span style="color: var(--text-muted);font-size:0.8rem">—</span>';
+            job._detailRow = '';
         }
 
-        // Build tier summary tooltip
+        // Also show tier summary details for done jobs
+        if (job.status === 'done' && (job.page_errors && job.page_errors.length > 0 || (job.tier_summary && Object.keys(job.tier_summary).some(k => job.tier_summary[k] > 0)))) {
+            const detailId = `detail-${job.id}`;
+            let detailHtml = '';
+            if (job.page_errors && job.page_errors.length > 0) {
+                detailHtml += '<div class="error-pages"><strong>Page warnings:</strong><ul>';
+                job.page_errors.forEach(pe => {
+                    detailHtml += `<li>Page ${pe.page}: ${escapeHtml(pe.error)}</li>`;
+                });
+                detailHtml += '</ul></div>';
+            }
+            if (job.tier_summary && Object.keys(job.tier_summary).some(k => job.tier_summary[k] > 0)) {
+                const tiers = [];
+                if (job.tier_summary.word) tiers.push(`${job.tier_summary.word} word-level`);
+                if (job.tier_summary.line) tiers.push(`${job.tier_summary.line} line-level`);
+                if (job.tier_summary.full_page) tiers.push(`${job.tier_summary.full_page} full-page`);
+                if (job.tier_summary.skip) tiers.push(`${job.tier_summary.skip} skipped`);
+                detailHtml += `<div class="error-tiers">OCR tiers: ${tiers.join(', ')}</div>`;
+            }
+            // Add expand button to actions
+            const toggleBtn = ` <button class="btn btn-sm expand-btn" onclick="toggleDetail('${detailId}')" title="Show details">Info</button>`;
+            actionsHtml += toggleBtn;
+            job._detailRow = `<tr class="detail-row" id="${detailId}" style="display:none;"><td colspan="5">${detailHtml}</td></tr>`;
+        } else if (!job._detailRow) {
+            job._detailRow = '';
+        }
+
+        // Build tier summary tooltip (for non-failed rows)
         let tierInfo = '';
-        if (job.tier_summary && Object.keys(job.tier_summary).length > 0) {
+        if (job.tier_summary && Object.keys(job.tier_summary).some(k => job.tier_summary[k] > 0)) {
             const parts = [];
             if (job.tier_summary.word) parts.push(`${job.tier_summary.word} word-level`);
             if (job.tier_summary.line) parts.push(`${job.tier_summary.line} line-level`);
+            if (job.tier_summary.full_page) parts.push(`${job.tier_summary.full_page} full-page`);
             if (job.tier_summary.skip) parts.push(`${job.tier_summary.skip} skipped`);
             tierInfo = `title="OCR tiers: ${parts.join(', ')}"`;
         }
@@ -456,6 +530,7 @@ function renderJobHistory(jobs) {
                 <td style="font-size:0.8rem;color:var(--text-secondary)">${timeStr}</td>
                 <td>${actionsHtml}</td>
             </tr>
+            ${job._detailRow || ''}
         `;
     }).join('');
 }
@@ -971,6 +1046,40 @@ async function testOllamaConnection() {
         }
     } finally {
         if (btn) btn.disabled = false;
+    }
+}
+
+// ---- Retry & Error Details (Sprint 5) ----
+
+async function retryJob(jobId) {
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/retry`, { method: 'POST' });
+        if (res.ok) {
+            showToast('Job re-queued for retry', 'success');
+            refreshJobs();
+        } else {
+            const err = await res.json();
+            showToast('Retry failed: ' + (err.detail || res.statusText), 'error');
+        }
+    } catch (err) {
+        showToast('Network error', 'error');
+    }
+}
+
+function toggleDetail(detailId) {
+    const row = document.getElementById(detailId);
+    if (row) {
+        const isVisible = row.style.display === 'table-row';
+        row.style.display = isVisible ? 'none' : 'table-row';
+
+        // Toggle the expand arrow on all expand buttons that reference this detailId
+        document.querySelectorAll(`.expand-btn[onclick*="${detailId}"]`).forEach(btn => {
+            if (isVisible) {
+                btn.classList.remove('expanded');
+            } else {
+                btn.classList.add('expanded');
+            }
+        });
     }
 }
 

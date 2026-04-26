@@ -83,6 +83,10 @@ class JobData:
         # Sprint 2 — Renaming & Tagging
         self.proposed_name: Optional[str] = None
         self.proposed_tags: list[str] = []
+        # Sprint 5 — Error tracking & retry
+        self.file_path: Optional[str] = None       # Saved upload path for retry
+        self.page_errors: list[dict] = []          # Per-page OCR failures
+        self.pdfa_saved: bool = False              # True if PDF/A was generated (partial output)
 
     def to_dict(self) -> dict:
         """
@@ -103,6 +107,8 @@ class JobData:
             "proposed_name": self.proposed_name,
             "proposed_tags": self.proposed_tags,
             "ocr_full_text": self.ocr_full_text,
+            "page_errors": self.page_errors,
+            "pdfa_saved": self.pdfa_saved,
         }
 
 
@@ -254,6 +260,11 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
     job_tmp = Path(tempfile.mkdtemp(prefix=f"docuforge_{job_id}_"))
 
     try:
+        # Track per-page errors for the job detail UI
+        page_errors: list[dict] = []
+        # Track whether PDF/A was generated (for partial output on failure)
+        pdfa_saved = False
+
         # ---- Step 1: Normalize to PDF ----
         suffix = file_path.suffix.lower()
         if suffix in IMAGE_SUFFIXES:
@@ -293,10 +304,12 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                     f"tier={result['tier']}, words={len(result.get('words', []))}"
                 )
             except OCRError as exc:
-                # OCR failed for this page — log and continue with remaining pages
+                # OCR failed for this page — log, track error, and continue
+                error_detail = f"{type(exc).__name__}: {exc}"
                 logger.warning(
-                    f"Job {job_id}: OCR failed for page {i + 1}/{total_pages}: {exc}"
+                    f"Job {job_id}: OCR failed for page {i + 1}/{total_pages}: {error_detail}"
                 )
+                page_errors.append({"page": i + 1, "error": error_detail})
                 ocr_results.append({
                     "full_text": "",
                     "words": [],
@@ -304,7 +317,7 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                     "ocr_success": False,
                 })
                 tier_summary["skip"] = tier_summary.get("skip", 0) + 1
-                job_manager.update_job(job_id, pages_done=i + 1)
+                job_manager.update_job(job_id, pages_done=i + 1, page_errors=page_errors)
 
         # Store OCR full text for Sprint 2 (renaming & tagging)
         ocr_full_text = "\n\n".join(all_text_parts)
@@ -313,6 +326,7 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
         output_filename = f"{file_path.stem}_ocr.pdf"
         pdfa_tmp = job_tmp / f"{file_path.stem}_pdfa.pdf"
         convert_to_pdfa(pdf_path, pdfa_tmp, settings.pdfa_level)
+        pdfa_saved = True  # From here on, we have a valid PDF/A for partial output
 
         # ---- Step 5: Layer OCR text onto PDF/A ----
         output_path = Path(settings.output_folder) / output_filename
@@ -364,6 +378,8 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 tags=proposed_tags,
                 proposed_name=proposed_name,
                 proposed_tags=proposed_tags,
+                page_errors=page_errors,
+                pdfa_saved=True,
             )
             logger.info(
                 f"Job {job_id} completed (auto-rename): {output_filename} "
@@ -380,6 +396,8 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 proposed_name=proposed_name,
                 proposed_tags=proposed_tags,
                 tags=[],
+                page_errors=page_errors,
+                pdfa_saved=True,
             )
             logger.info(
                 f"Job {job_id} awaiting approval — proposed: "
@@ -390,11 +408,29 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
         # Unrecoverable error — mark job as failed
         error_msg = f"{type(exc).__name__}: {exc}"
         logger.error(f"Job {job_id} failed: {error_msg}", exc_info=True)
+
+        # Save partial output if PDF/A conversion succeeded
+        partial_output = None
+        if pdfa_saved and job_tmp.exists():
+            try:
+                partial_name = f"{file_path.stem}_partial.pdf"
+                partial_path = Path(settings.output_folder) / partial_name
+                # Find the PDF/A temp file (it might still exist if text layering failed)
+                if pdfa_tmp.exists():
+                    shutil.copy(pdfa_tmp, partial_path)
+                    partial_output = partial_name
+                    logger.info(f"Partial output saved: {partial_name}")
+            except Exception as copy_exc:
+                logger.warning(f"Failed to save partial output: {copy_exc}")
+
         job_manager.update_job(
             job_id,
             status=JobStatus.FAILED,
             finished_at=datetime.now(timezone.utc),
             error=error_msg,
+            output_filename=partial_output,
+            pdfa_saved=pdfa_saved,
+            page_errors=page_errors,
         )
 
     finally:

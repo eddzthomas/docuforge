@@ -189,6 +189,8 @@ async def upload_files(
         # Create a processing job and enqueue it
         # The queue worker picks it up and calls process_file()
         job = job_manager.create_job(file.filename)
+        # Store the actual saved file path so retry can find it later
+        job_manager.update_job(job.id, file_path=str(file_path))
         job_queue.enqueue(job.id, file_path)
 
         jobs_created.append(job.to_dict())
@@ -476,6 +478,65 @@ async def list_tags():
     return JSONResponse([
         {"tag": tag, "count": count} for tag, count in sorted_tags
     ])
+
+
+# =============================================================================
+# Sprint 5: Error Handling & Retry
+# =============================================================================
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(job_id: str):
+    """
+    Re-enqueue a failed job for processing.
+
+    Locates the original uploaded file from the stored file_path,
+    resets the job status to queued, and puts it back in the queue.
+    Returns 400 if the job is not in failed status or the file is missing.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    if job.status != JobStatus.FAILED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job {job_id} is not in failed state (current: {job.status.value})",
+        )
+
+    if not job.file_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Job has no stored file path — cannot retry. Re-upload the file instead.",
+        )
+
+    file_path = Path(job.file_path)
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Original file not found at {job.file_path}. It may have been deleted. Re-upload instead.",
+        )
+
+    # Reset job state and re-enqueue
+    job_manager.update_job(
+        job_id,
+        status=JobStatus.QUEUED,
+        error=None,
+        finished_at=None,
+        pages=0,
+        pages_done=0,
+        page_errors=[],
+        pdfa_saved=False,
+        tier_summary={},
+        ocr_full_text=None,
+        tags=[],
+        proposed_name=None,
+        proposed_tags=[],
+    )
+    job_queue.enqueue(job_id, file_path)
+
+    logger.info(f"Job {job_id} re-enqueued for retry")
+    return JSONResponse(job_manager.get_job(job_id).to_dict())
 
 
 # =============================================================================
