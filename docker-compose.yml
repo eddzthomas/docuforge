@@ -5,8 +5,9 @@
 # Services:
 #   docuforge  —  FastAPI web app on port 8080
 #   ollama     —  Local LLM runtime for GLM-OCR and tagging models
-
-version: "3.9"
+#
+# GPU users:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 
 services:
   # ---- Web application ----
@@ -19,13 +20,16 @@ services:
       - OLLAMA_HOST=http://ollama:11434
       - UPLOAD_FOLDER=/data/uploads
       - OUTPUT_FOLDER=/data/output
+      - CONFIG_PATH=/data/settings.json
+      - OLLAMA_AUTO_PULL=true
+      - OLLAMA_AUTO_PULL_MODELS=glm-ocr,llama3.2
     volumes:
-      # Mount local data dirs into the container
-      - ./data/uploads:/data/uploads
-      - ./data/output:/data/output
+      # Mount the entire data directory — uploads, output, and UI-saved settings
+      # all persist on the host at ./data/
+      - ./data:/data
     depends_on:
       ollama:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - docuforge-net
@@ -43,6 +47,12 @@ services:
     networks:
       - docuforge-net
     # CPU-only by default. Override with docker-compose.gpu.yml for NVIDIA GPUs.
+    healthcheck:
+      test: ["CMD", "ollama", "ps"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
 
 volumes:
   ollama-data:

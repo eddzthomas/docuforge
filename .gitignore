@@ -9,7 +9,8 @@ venv/
 .env
 *.env.local
 
-# Data folders
+# User-specific settings (saved via web UI Settings tab)
+data/settings.json
 data/uploads/*
 data/output/*
 !data/uploads/.gitkeep

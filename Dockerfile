@@ -7,11 +7,12 @@ FROM python:3.11-slim-bookworm
 
 # Install system dependencies:
 #   poppler-utils  —  pdftoppm, pdfinfo (required by pdf2image)
-#   tesseract-ocr  —  included for fallback / future use
+#   curl           —  Used by entrypoint to auto-pull Ollama models
 #   libgl1-mesa-glx — OpenGL lib for some Pillow operations
 #   libglib2.0-0   — GLib runtime needed by poppler on slim images
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
+    curl \
     libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
@@ -28,16 +29,17 @@ COPY requirements.txt .
 # Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code and scripts
 COPY app/ ./app/
 COPY scripts/ ./scripts/
 
-# Make scripts executable
-RUN chmod +x ./scripts/*.sh
+# Copy and set up entrypoint
+COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
 
-# Create data directories for volume mounts
+# Create data directories and set ownership
 RUN mkdir -p /data/uploads /data/output && \
-    chown -R docuforge:docuforge /data /app
+    chown -R docuforge:docuforge /data /app /docker-entrypoint.sh
 
 # Switch to non-root user
 USER docuforge
@@ -46,8 +48,8 @@ USER docuforge
 EXPOSE 8080
 
 # Health check — app must respond on /api/health
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8080/api/health').raise_for_status()" || exit 1
 
-# Start the FastAPI app via uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Entrypoint handles dir creation, model pull, then starts uvicorn
+ENTRYPOINT ["/docker-entrypoint.sh"]
