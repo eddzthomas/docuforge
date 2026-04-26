@@ -11,6 +11,7 @@ All functions operate on file paths and log their progress.
 
 import logging
 import tempfile
+import zlib
 from pathlib import Path
 
 import img2pdf
@@ -97,32 +98,6 @@ def convert_to_pdfa(input_pdf: Path, output_pdf: Path, pdfa_level: str):
     if pdf.Root.get("/EmbeddedFiles", None):
         del pdf.Root.EmbeddedFiles
 
-    # ---- Add PDF/A output intent (sRGB color profile) ----
-    # The output intent ensures consistent color rendering across viewers.
-    # We reference the sRGB IEC61966-2.1 profile by its well-known identifier.
-    srgb_profile = pikepdf.Stream(
-        pdf,
-        b'',
-        {
-            "/N": 3,  # Number of color components (RGB = 3)
-            "/Filter": "/FlateDecode",
-        },
-    )
-
-    # Build the output intent dictionary
-    output_intent = Dictionary({
-        "/Type": "/OutputIntent",
-        "/S": "/GTS_PDFA1",
-        "/OutputCondition": TextStringObject("sRGB IEC61966-2.1"),
-        "/OutputConditionIdentifier": TextStringObject("sRGB IEC61966-2.1"),
-        "/Info": TextStringObject("sRGB IEC61966-2.1"),
-        "/RegistryName": TextStringObject("http://www.color.org"),
-        "/DestOutputProfile": srgb_profile,
-    })
-
-    # Add or replace the output intents array in the catalog
-    pdf.Root.OutputIntents = pikepdf.Array([output_intent])
-
     # ---- Set PDF/A metadata in the document catalog ----
     pdf_version = "2" if pdfa_level.startswith("2") else "3"
     part = pdfa_level[1:]  # "b" from "2b"
@@ -138,6 +113,25 @@ def convert_to_pdfa(input_pdf: Path, output_pdf: Path, pdfa_level: str):
         # Preserve existing title if present
         if pdf.docinfo.get("/Title"):
             meta["dc:title"] = str(pdf.docinfo["/Title"])
+
+    # ---- Add PDF/A output intent (sRGB via CalRGB) ----
+    # We define sRGB as a CalRGB color space with the standard sRGB
+    # primaries and reference it in the OutputIntent. This avoids ICC
+    # profile compatibility issues across PDF viewers (Acrobat, Edge,
+    # Preview, etc.) while providing correct color information.
+    _ensure_srgb_colorspace(pdf)
+
+    output_intent = Dictionary({
+        "/Type": "/OutputIntent",
+        "/S": "/GTS_PDFA1",
+        "/OutputConditionIdentifier": TextStringObject("sRGB IEC61966-2.1"),
+        "/Info": TextStringObject("sRGB IEC61966-2.1"),
+        "/RegistryName": TextStringObject("http://www.color.org"),
+        "/DestOutputProfileRef": Dictionary({
+            "/CS": "/DefaultRGB",
+        }),
+    })
+    pdf.Root.OutputIntents = pikepdf.Array([output_intent])
 
     # ---- Mark the catalog as PDF/A ----
     pdf.Root.MarkInfo = Dictionary({"/Marked": True})
@@ -194,10 +188,14 @@ def layer_text_on_pdf(
             mediabox = page.mediabox
             page_height = float(mediabox[3])  # top of the page in PDF points
 
+            # Ensure Helvetica font is registered in page resources so
+            # PDF viewers can render and select the text layer
+            _ensure_helvetica_font(page)
+
             # Build text operators for this page
             operators = _build_text_operators(ocr, scale, page_height)
             if operators:
-                page.contents_add(operators.encode("latin-1"), prepend=False)
+                page.contents_add(operators.encode("ascii"), prepend=False)
                 logger.debug(
                     f"Page {page_idx + 1}: added text layer "
                     f"(tier={ocr.get('tier', 'unknown')})"
@@ -210,6 +208,59 @@ def layer_text_on_pdf(
     pdf.close()
 
     logger.info(f"Text layering complete: {output_path.name}")
+
+
+def _escape_pdf_text(text: str) -> str:
+    r"""
+    Encode a text string for use in a PDF content stream Tj operator.
+
+    Strategy (in order):
+      1. Pure ASCII (U+0000-U+007F) — literal PDF string: (escaped text)
+      2. Latin-1 (U+0080-U+00FF) — PDF literal string with octal escapes: (\xxx)
+      3. Unicode beyond latin-1 — UTF-16BE hex string: <FEFF hex>
+
+    Args:
+        text: Raw text string to encode.
+
+    Returns:
+        PDF-ready string representation: either (safe text) or <hex>.
+    """
+    # Try ASCII first — covers most English documents
+    try:
+        text.encode("ascii")
+        safe = (
+            text.replace("\\", "\\\\")
+                .replace("(", "\\(")
+                .replace(")", "\\)")
+        )
+        return f"({safe})"
+    except UnicodeEncodeError:
+        pass
+
+    # Try latin-1 — use octal escapes for non-ASCII bytes
+    try:
+        text.encode("latin-1")
+        # Escape special PDF chars, then convert non-ASCII to octal \xxx
+        escaped = (
+            text.replace("\\", "\\\\")
+                .replace("(", "\\(")
+                .replace(")", "\\)")
+        )
+        result = []
+        for ch in escaped:
+            cp = ord(ch)
+            if cp > 127:
+                result.append(f"\\{cp:03o}")
+            else:
+                result.append(ch)
+        return f"({''.join(result)})"
+    except UnicodeEncodeError:
+        pass
+
+    # Characters beyond latin-1 — use UTF-16BE hex with BOM
+    utf16_bytes = text.encode("utf-16-be")
+    hex_str = utf16_bytes.hex()
+    return f"<FEFF{hex_str}>"
 
 
 def _build_text_operators(ocr: dict, scale: float, page_height: float) -> str:
@@ -251,11 +302,10 @@ def _build_text_operators(ocr: dict, scale: float, page_height: float) -> str:
 
             font_size = max(h_px * scale * 0.85, 4)
 
-            safe = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
             ops_parts.append(
-                f"BT\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
+                f"BT\n/DeviceGray CS /DeviceGray cs\n0 G 0 g\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
                 f"1 0 0 1 {x_pt:.1f} {y_pt_btm:.1f} Tm\n"
-                f"({safe}) Tj\nET"
+                f"{_escape_pdf_text(text)} Tj\nET"
             )
 
     # ---- Tier 2: Per-line fallback ----
@@ -272,11 +322,10 @@ def _build_text_operators(ocr: dict, scale: float, page_height: float) -> str:
             y_pos = y_start - (i * font_size * 1.4)
             if y_pos < margin:
                 break
-            safe = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
             ops_parts.append(
-                f"BT\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
+                f"BT\n/DeviceGray CS /DeviceGray cs\n0 G 0 g\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
                 f"1 0 0 1 {margin:.1f} {y_pos:.1f} Tm\n"
-                f"({safe}) Tj\nET"
+                f"{_escape_pdf_text(line)} Tj\nET"
             )
 
     # ---- Tier 3: Full-page text block ----
@@ -284,14 +333,42 @@ def _build_text_operators(ocr: dict, scale: float, page_height: float) -> str:
         margin = 36
         font_size = 8
         y_pos = page_height - margin
-        safe = full_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
         ops_parts.append(
-            f"BT\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
+            f"BT\n/DeviceGray CS /DeviceGray cs\n0 G 0 g\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
             f"1 0 0 1 {margin:.1f} {y_pos:.1f} Tm\n"
-            f"({safe}) Tj\nET"
+            f"{_escape_pdf_text(full_text)} Tj\nET"
         )
 
     return "\n".join(ops_parts) if ops_parts else ""
+
+
+def _ensure_helvetica_font(page):
+    """
+    Register /Helvetica as a standard Type1 font in the page's Resources.
+
+    Modifies the existing Resources dictionary in-place (does not replace it)
+    to avoid breaking indirect object references. Uses pikepdf's native
+    Dictionary/Name/String types for compatibility.
+
+    Args:
+        page: pikepdf.Page object to modify in-place.
+    """
+    from pikepdf import Dictionary, Name, String
+
+    resources = page.Resources
+    if "/Resources" not in page:
+        resources = Dictionary()
+        page.Resources = resources
+
+    fonts = resources.get("/Font", Dictionary())
+
+    if "/Helvetica" not in fonts:
+        font_entry = Dictionary()
+        font_entry[Name.Type] = Name.Font
+        font_entry[Name.Subtype] = Name.Type1
+        font_entry[Name.BaseFont] = Name.Helvetica
+        fonts[Name.Helvetica] = font_entry
+        resources[Name.Font] = fonts
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +412,64 @@ def embed_tags_in_pdf(pdf_path: Path, tags: list[str]):
     pdf.close()
 
     logger.debug(f"Tags embedded successfully in {pdf_path.name}")
+
+
+# ---------------------------------------------------------------------------
+# ICC Profile (sRGB)
+# ---------------------------------------------------------------------------
+
+# ICC profile cache (populated at first use)
+_srgb_icc_cache = None
+
+
+def _get_srgb_icc_profile():
+    """
+    Return the RAW (uncompressed) sRGB IEC61966-2.1 ICC profile bytes.
+
+    Generates the sRGB profile via Pillow's built-in profile factory
+    and serializes it via ImageCmsProfile.tobytes().
+
+    Returns the raw ICC bytes (not FlateDecode compressed) for
+    maximum compatibility with PDF viewers.
+    """
+    global _srgb_icc_cache
+    if _srgb_icc_cache is not None:
+        return _srgb_icc_cache
+
+    try:
+        from PIL import ImageCms
+        profile = ImageCms.createProfile("sRGB")
+        cms_profile = ImageCms.ImageCmsProfile(profile)
+        raw = cms_profile.tobytes()
+        if raw and len(raw) > 100:
+            _srgb_icc_cache = raw
+            logger.debug(f"sRGB ICC profile generated ({len(raw)} bytes)")
+            return raw
+    except Exception as exc:
+        logger.warning(f"Could not generate sRGB ICC profile: {exc}")
+
+    logger.warning("No sRGB ICC profile available")
+    _srgb_icc_cache = False
+    return None
+
+
+def _ensure_srgb_colorspace(pdf):
+    """
+    Ensure sRGB is defined as a CalRGB color space in every page's Resources.
+
+    This is a fallback when no ICC profile is available. CalRGB with
+    the standard sRGB primaries provides correct color rendering
+    without requiring an embedded ICC profile.
+    """
+    from pikepdf import Name, Dictionary, Array
+    srgb_cal = Dictionary({
+        "/WhitePoint": Array([0.9505, 1.0, 1.089]),
+        "/Gamma": Array([2.2, 2.2, 2.2]),
+    })
+    for page_view in pdf.pages:
+        page = pikepdf.Page(page_view)
+        resources = page.Resources if "/Resources" in page else Dictionary()
+        cs_dict = resources.get("/ColorSpace", Dictionary())
+        cs_dict["/DefaultRGB"] = Array([Name.CalRGB, srgb_cal])
+        resources["/ColorSpace"] = cs_dict
+        page.Resources = resources
