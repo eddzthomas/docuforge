@@ -12,6 +12,7 @@ pypdf>=5.0.0           # Text layer placement on PDF pages
 img2pdf>=0.5.1         # Lossless image-to-PDF conversion
 pdf2image>=1.17.0      # Render PDF pages to PNG images
 Pillow>=10.0.0         # Image manipulation (underlies pdf2image)
+pytesseract>=0.3.10    # Tesseract OCR Python wrapper (CPU fallback)
 
 # HTTP client (for Ollama API calls)
 httpx>=0.27.0

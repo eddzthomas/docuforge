@@ -7,11 +7,14 @@ FROM python:3.11-slim-bookworm
 
 # Install system dependencies:
 #   poppler-utils  —  pdftoppm, pdfinfo (required by pdf2image)
+#   tesseract-ocr  —  OCR engine (CPU-only fallback when GLM-OCR unavailable)
 #   curl           —  Used by entrypoint to auto-pull Ollama models
 #   libgl1-mesa-glx — OpenGL lib for some Pillow operations
 #   libglib2.0-0   — GLib runtime needed by poppler on slim images
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     curl \
     libgl1-mesa-glx \
     libglib2.0-0 \

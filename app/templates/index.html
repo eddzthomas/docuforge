@@ -128,6 +128,13 @@
                 <input type="text" id="cfg-ocr-model" value="glm-ocr">
             </div>
             <div class="form-group">
+                <label for="cfg-ocr-engine">OCR Engine</label>
+                <select id="cfg-ocr-engine">
+                    <option value="tesseract">Tesseract (CPU — always works)</option>
+                    <option value="glm-ocr">GLM-OCR (Ollama GPU)</option>
+                </select>
+            </div>
+            <div class="form-group">
                 <label for="cfg-tagging-model">Tagging Model</label>
                 <input type="text" id="cfg-tagging-model" value="llama3.2">
             </div>
@@ -921,6 +928,7 @@ async function loadConfig() {
         // Populate form fields from config values
         setFieldValue('cfg-ollama-host', cfg.ollama_host);
         setFieldValue('cfg-ocr-model', cfg.ocr_model);
+        setFieldValue('cfg-ocr-engine', cfg.ocr_engine);
         setFieldValue('cfg-tagging-model', cfg.tagging_model);
         setFieldValue('cfg-dpi', cfg.dpi);
         setFieldValue('cfg-pdfa-level', cfg.pdfa_level);
@@ -962,6 +970,7 @@ async function saveConfig() {
     const data = {
         ollama_host: document.getElementById('cfg-ollama-host').value.trim(),
         ocr_model: document.getElementById('cfg-ocr-model').value.trim(),
+        ocr_engine: document.getElementById('cfg-ocr-engine').value,
         tagging_model: document.getElementById('cfg-tagging-model').value.trim(),
         dpi: parseInt(document.getElementById('cfg-dpi').value) || 300,
         pdfa_level: document.getElementById('cfg-pdfa-level').value,

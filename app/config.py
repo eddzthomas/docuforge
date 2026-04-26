@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # ---- Ollama ----
     ollama_host: str = "http://ollama:11434"
     ocr_model: str = "glm-ocr"
+    ocr_engine: str = "tesseract"  # "tesseract" (CPU) or "glm-ocr" (Ollama vision model)
     tagging_model: str = "llama3.2"
 
     # ---- Processing ----
@@ -229,6 +230,7 @@ def get_editable_fields() -> list[str]:
     return [
         "ollama_host",
         "ocr_model",
+        "ocr_engine",
         "tagging_model",
         "dpi",
         "pdfa_level",

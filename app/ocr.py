@@ -1,12 +1,11 @@
 """
-DocuForge — OCR Engine (GLM-OCR via Ollama)
-=============================================
-Sends rendered page images to the local Ollama instance running
-GLM-OCR, parses the structured JSON response, and returns
-recognized text with per-word bounding boxes.
+DocuForge — OCR Engine (GLM-OCR via Ollama + Tesseract fallback)
+==================================================================
+Two OCR backends:
+  - Tesseract: CPU-only, fast, reliable, per-word bounding boxes
+  - GLM-OCR:  Ollama vision model, GPU-accelerated, higher quality
 
-Defensive fallback: if bounding boxes are missing or malformed,
-falls back to per-line → full-page → skip-page tiers.
+Both return the same structured dict for seamless text layering.
 """
 
 import base64
@@ -15,6 +14,8 @@ import logging
 from pathlib import Path
 
 import httpx
+import pytesseract
+from PIL import Image
 
 from app.config import Settings
 
@@ -33,6 +34,112 @@ class OCRError(Exception):
 
 
 async def ocr_page(image_path: Path, settings: Settings) -> dict:
+    """
+    Dispatch OCR to the configured engine.
+
+    Args:
+        image_path: Absolute path to the rendered page image.
+        settings: Application settings with ocr_engine choice.
+
+    Returns:
+        Standardized dict with full_text, words, tier, ocr_success.
+    """
+    if settings.ocr_engine == "tesseract":
+        return _ocr_page_tesseract(image_path)
+    else:
+        return await _ocr_page_glm(image_path, settings)
+
+
+# ---- Tesseract OCR (CPU fallback) ----
+def _ocr_page_tesseract(image_path: Path) -> dict:
+    """
+    Run Tesseract OCR on a page image with per-word bounding boxes.
+
+    Tesseract is a battle-tested OCR engine that runs entirely on CPU.
+    It returns character-level and word-level bounding boxes via the
+    TSV output format, which we parse into our standard dict format.
+
+    Args:
+        image_path: Path to the rendered page PNG.
+
+    Returns:
+        Standardized OCR result dict.
+    """
+    logger.info(f"[{image_path.name}] Running Tesseract OCR...")
+
+    try:
+        # Open the image with Pillow
+        img = Image.open(image_path)
+
+        # Get full text from Tesseract
+        full_text = pytesseract.image_to_string(img).strip()
+
+        # Get per-word bounding boxes via TSV output
+        tsv_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+        # Parse word-level bounding boxes
+        words = []
+        for i in range(len(tsv_data["text"])):
+            text = tsv_data["text"][i].strip()
+            conf = int(tsv_data["conf"][i]) if tsv_data["conf"][i] != "-1" else 0
+
+            # Skip empty words or low-confidence entries
+            if not text or conf < 30:
+                continue
+
+            # Tesseract returns x, y, w, h in pixels
+            x = tsv_data["left"][i]
+            y = tsv_data["top"][i]
+            w = tsv_data["width"][i]
+            h = tsv_data["height"][i]
+
+            if w > 0 and h > 0:
+                words.append({
+                    "text": text,
+                    "bbox": [x, y, w, h],
+                })
+
+        if words:
+            logger.info(
+                f"[{image_path.name}] Tesseract: {len(words)} words, "
+                f"tier=word"
+            )
+            return {
+                "full_text": full_text,
+                "words": words,
+                "tier": "word",
+                "ocr_success": True,
+            }
+        elif full_text:
+            logger.info(
+                f"[{image_path.name}] Tesseract: text extracted, "
+                f"tier=line (no valid word bboxes)"
+            )
+            return {
+                "full_text": full_text,
+                "words": [],
+                "tier": "line",
+                "ocr_success": True,
+            }
+        else:
+            logger.warning(f"[{image_path.name}] Tesseract: no text found")
+            return {
+                "full_text": "",
+                "words": [],
+                "tier": "skip",
+                "ocr_success": False,
+            }
+
+    except Exception as exc:
+        logger.error(f"[{image_path.name}] Tesseract failed: {exc}")
+        return {
+            "full_text": "",
+            "words": [],
+            "tier": "skip",
+            "ocr_success": False,
+        }
+# ---- GLM-OCR (Ollama vision model) ----
+async def _ocr_page_glm(image_path: Path, settings: Settings) -> dict:
     """
     Send a single rendered page image to GLM-OCR via Ollama
     and return structured text with bounding boxes.
