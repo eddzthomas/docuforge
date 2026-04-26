@@ -161,13 +161,11 @@ def layer_text_on_pdf(
     dpi: int = 300,
 ):
     """
-    Layer OCR'd text invisibly onto a PDF/A file so the text is
-    selectable, searchable, and copyable while preserving the
-    original scanned visual appearance.
+    Layer OCR'd text invisibly onto a PDF/A file using pikepdf.
 
-    Uses pypdf to add text with rendering mode 3 (invisible/neither
-    fill nor stroke) so the text exists in the PDF content stream
-    but is not visually rendered.
+    Text is written as content stream operators with rendering mode 3
+    (Tr = 3 — neither fill nor stroke), making it selectable and
+    searchable while preserving the original visual appearance.
 
     Defensive tiers for text placement:
       Tier 1 — Per-word: Each word placed at its exact bounding box
@@ -176,55 +174,64 @@ def layer_text_on_pdf(
 
     Args:
         pdfa_path: Path to the PDF/A file (output of convert_to_pdfa).
-        ocr_results: List of OCR result dicts, one per page:
-            {"full_text": str, "words": list, "tier": str, "ocr_success": bool}
+        ocr_results: List of OCR result dicts, one per page.
         output_path: Path to write the final PDF with text layer.
         dpi: DPI used when rendering pages (needed for coord scaling).
     """
     logger.info(f"Layering OCR text onto PDF/A: {pdfa_path.name}")
 
-    # Pixel-to-PDF-point scale factor
-    # PDF coordinates are in points (1 pt = 1/72 inch).
-    # Image coords are in pixels at the render DPI.
-    # scale = 72 / dpi converts pixels to points.
-    scale = 72.0 / dpi
+    scale = 72.0 / dpi  # pixels → PDF points
 
-    # Open the PDF/A for reading and create a writer for the output
-    reader = PdfReader(str(pdfa_path))
-    writer = PdfWriter()
+    # Open the PDF/A with pikepdf (same library we use for conversion)
+    pdf = pikepdf.open(pdfa_path, allow_overwriting_input=True)
 
-    # Process each page — copy the original content and add text layer
-    for page_idx, page in enumerate(reader.pages):
+    for page_idx, page_view in enumerate(pdf.pages):
         ocr = ocr_results[page_idx] if page_idx < len(ocr_results) else None
 
         if ocr and ocr.get("ocr_success") and ocr.get("full_text"):
-            # Add invisible text layer based on the tier from OCR
-            _add_text_layer_for_page(page, ocr, scale)
+            # Get page dimensions for coordinate conversion
+            page = pikepdf.Page(page_view)
+            mediabox = page.mediabox
+            page_height = float(mediabox[3])  # top of the page in PDF points
+
+            # Build text operators for this page
+            operators = _build_text_operators(ocr, scale, page_height)
+            if operators:
+                page.contents_add(operators.encode("latin-1"), prepend=False)
+                logger.debug(
+                    f"Page {page_idx + 1}: added text layer "
+                    f"(tier={ocr.get('tier', 'unknown')})"
+                )
         else:
             logger.debug(f"Page {page_idx + 1}: No OCR text — skipping text layer")
 
-        writer.add_page(page)
-
-    # Write the final PDF
-    with open(output_path, "wb") as f:
-        writer.write(f)
+    # Save with text layer
+    pdf.save(output_path, linearize=True)
+    pdf.close()
 
     logger.info(f"Text layering complete: {output_path.name}")
 
 
-def _add_text_layer_for_page(page: PageObject, ocr: dict, scale: float):
+def _build_text_operators(ocr: dict, scale: float, page_height: float) -> str:
     """
-    Add invisible text to a single PDF page based on the OCR tier.
+    Build PDF content stream operators for invisible text on one page.
+
+    Returns a string of BT/ET text blocks, one per word or line,
+    with text rendering mode set to 3 (invisible).
 
     Args:
-        page: pypdf PageObject to modify.
         ocr: OCR result dict for this page.
         scale: Pixel-to-point scale factor (72 / dpi).
+        page_height: PDF page height in points (mediabox[3]).
+
+    Returns:
+        String of PDF content stream operators, or empty string.
     """
     tier = ocr.get("tier", "full_page")
     full_text = ocr.get("full_text", "")
     words = ocr.get("words", [])
-    page_height = float(page.mediabox.height)
+
+    ops_parts = []
 
     # ---- Tier 1: Per-word positioning ----
     if tier == "word" and words:
@@ -235,38 +242,27 @@ def _add_text_layer_for_page(page: PageObject, ocr: dict, scale: float):
             if not text or len(bbox) != 4:
                 continue
 
-            # Convert pixel bbox to PDF point coordinates
-            # PDF y-axis is bottom-up; image y-axis is top-down
             x, y_img, w_px, h_px = bbox
             x_pt = x * scale
-            # Invert y: image top → PDF bottom
-            y_pt = page_height - ((y_img + h_px) * scale)
-            w_pt = w_px * scale
-            h_pt = h_px * scale
+            # PDF y-axis is bottom-up; image y-axis is top-down
+            # Use the actual image height by checking the loaded PDF
+            # We'll do this inside layer_text_on_pdf; for now use the bbox
+            y_pt_btm = page_height - ((y_img + h_px) * scale)
 
-            # Estimate font size from bbox height
-            font_size = max(h_pt * 0.85, 4)  # Minimum 4pt to stay visible
+            font_size = max(h_px * scale * 0.85, 4)
 
-            # Draw invisible text (rendering mode 3 = invisible)
-            _draw_invisible_text(page, text, x_pt, y_pt, w_pt, font_size)
+            safe = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            ops_parts.append(
+                f"BT\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
+                f"1 0 0 1 {x_pt:.1f} {y_pt_btm:.1f} Tm\n"
+                f"({safe}) Tj\nET"
+            )
 
     # ---- Tier 2: Per-line fallback ----
     elif tier == "line" and full_text:
         lines = full_text.strip().split("\n")
-        if not lines:
-            return
-
-        margin = 36  # 0.5 inch margin
-        usable_height = page_height - (2 * margin)
-        # Fixed font size; lines evenly spaced
+        margin = 36
         font_size = 10
-        line_height = font_size * 1.4
-        max_lines_fit = int(usable_height / line_height)
-
-        # If text has more lines than fit, scale down font size
-        if len(lines) > max_lines_fit:
-            font_size = max(usable_height / (len(lines) * 1.4), 6)
-
         y_start = page_height - margin
 
         for i, line in enumerate(lines):
@@ -274,93 +270,28 @@ def _add_text_layer_for_page(page: PageObject, ocr: dict, scale: float):
             if not line:
                 continue
             y_pos = y_start - (i * font_size * 1.4)
-
-            # Skip if we've gone past the bottom margin
             if y_pos < margin:
                 break
-
-            # Text width = available page width minus margins
-            page_width = float(page.mediabox.width)
-            text_width = page_width - (2 * margin)
-
-            _draw_invisible_text(page, line, margin, y_pos, text_width, font_size)
+            safe = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            ops_parts.append(
+                f"BT\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
+                f"1 0 0 1 {margin:.1f} {y_pos:.1f} Tm\n"
+                f"({safe}) Tj\nET"
+            )
 
     # ---- Tier 3: Full-page text block ----
     elif full_text:
         margin = 36
         font_size = 8
-        page_width = float(page.mediabox.width)
-        text_width = page_width - (2 * margin)
         y_pos = page_height - margin
-
-        _draw_invisible_text(page, full_text, margin, y_pos, text_width, font_size)
-
-
-def _draw_invisible_text(
-    page: PageObject,
-    text: str,
-    x: float,
-    y: float,
-    width: float,
-    font_size: float,
-):
-    """
-    Draw invisible text on a PDF page using pypdf's text insertion.
-
-    The text uses rendering mode 3 (invisible — neither fill nor stroke)
-    which means it is selectable and searchable in PDF readers but does
-    not alter the visual appearance of the scanned page.
-
-    pypdf's text insertion via the content stream adds text objects
-    that can be selected and searched.
-
-    Args:
-        page: pypdf PageObject.
-        text: Text string to place.
-        x: X position in PDF points from left.
-        y: Y position in PDF points from bottom.
-        width: Available text width in points.
-        font_size: Font size in points.
-    """
-    # pypdf PageObject does not have a direct method for inserting
-    # text at specific coordinates, so we manipulate the content stream.
-
-    # We use the page's text insertion method to add visible text
-    # at the target position, then mark it as invisible via content stream.
-
-    # For simplicity and reliability, we add text using the built-in
-    # method and rely on FreeText annotations for invisible text later.
-    # This is a pragmatic approach — the text will be selectable.
-
-    # Actually, the most reliable approach with pypdf is to add
-    # annotations. Let's use the page's built-in text addition.
-
-    # For now, use the simplest approach: add the text using
-    # page.insert_text which places text in the content stream.
-    # The text will be visible — we can make it transparent in
-    # a future enhancement, but for Sprint 1 the text being
-    # selectable/searchable is the core requirement.
-
-    # Note: Truly invisible text requires modifying the content
-    # stream's text rendering mode (3 Tr). pypdf doesn't expose
-    # this directly, so we use a workaround: place text with
-    # a transparent color so it's effectively invisible but
-    # still in the PDF text layer.
-
-    try:
-        # Place text using pypdf's native method
-        # The text is added as page content — selectable and searchable
-        page.insert_text(
-            text,
-            x=x,
-            y=y,
-            font_name="Helvetica",
-            font_size=font_size,
+        safe = full_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        ops_parts.append(
+            f"BT\n3 Tr\n/Helvetica {font_size:.1f} Tf\n"
+            f"1 0 0 1 {margin:.1f} {y_pos:.1f} Tm\n"
+            f"({safe}) Tj\nET"
         )
-    except Exception as exc:
-        logger.warning(
-            f"Failed to insert text at ({x:.0f}, {y:.0f}): {exc}"
-        )
+
+    return "\n".join(ops_parts) if ops_parts else ""
 
 
 # ---------------------------------------------------------------------------
