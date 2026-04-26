@@ -1,0 +1,24 @@
+# DocuForge — Remote Ollama override
+# ============================================================
+# Use this when you want to run DocuForge with a cloud/remote
+# Ollama instance instead of the local container.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.remote-ollama.yml up --build
+#
+# Then set OLLAMA_HOST in .env or the Settings tab to your
+# remote Ollama URL (e.g. https://your-gpu-server:11434).
+#
+# The local ollama container will NOT be started.
+
+services:
+  docuforge:
+    environment:
+      - OLLAMA_AUTO_PULL=false
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+    depends_on: []  # No dependency on local ollama
+
+  # Disable the local ollama service
+  ollama:
+    profiles:
+      - local-only

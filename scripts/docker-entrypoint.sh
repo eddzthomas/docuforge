@@ -43,18 +43,18 @@ if [ "${OLLAMA_AUTO_PULL}" = "true" ] && [ -n "${OLLAMA_AUTO_PULL_MODELS}" ]; th
         sleep 2
     done
 
-    # Pull each model
+    # Pull each model in the background (don't block app startup)
     IFS=',' read -ra MODELS <<< "${OLLAMA_AUTO_PULL_MODELS}"
     for model in "${MODELS[@]}"; do
         model=$(echo "$model" | xargs)  # Trim whitespace
         if [ -n "$model" ]; then
-            echo "  Pulling model: $model"
+            echo "  Starting background pull for: $model"
             curl -s -X POST "http://${OLLAMA_HOST_CLEAN}:11434/api/pull" \
-                -d "{\"name\": \"$model\"}" || echo "  (pull may continue in background)"
+                -d "{\"name\": \"$model\"}" > /dev/null 2>&1 &
         fi
     done
 
-    echo "  Model pull requests sent."
+    echo "  Model pull(s) started in background. Check 'docker logs docuforge-ollama' for progress."
 fi
 
 echo ""

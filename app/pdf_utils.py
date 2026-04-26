@@ -15,7 +15,6 @@ from pathlib import Path
 
 import img2pdf
 import pikepdf
-from pikepdf import Name, Dictionary, PdfMetadata
 from pypdf import PdfWriter, PdfReader, PageObject
 from pypdf.generic import (
     ArrayObject,

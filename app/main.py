@@ -107,7 +107,7 @@ async def index(request: Request):
     """
     Serve the main web UI (single-page app shell with three tabs).
     """
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 
 @app.get("/api/health")
