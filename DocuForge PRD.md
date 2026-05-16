@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary
 
-DocuForge is a self-hosted web application that ingests scanned PDF files and images from a watched folder, converts them to PDF/A (ISO-standard archival format), performs Optical Character Recognition (OCR) using a locally-running GLM-OCR model via Ollama, layers the recognized text invisibly on top of the PDF/A, and outputs the final searchable/selectable document to a destination folder.
+DocuForge is a self-hosted web application that ingests scanned PDF files and images from a watched folder, converts them to PDF/A (ISO-standard archival format), performs Optical Character Recognition (OCR) using a locally-running Tesseract engine or GLM-OCR vision model via Ollama, layers the recognized text invisibly on top of the PDF/A, and outputs the final searchable/selectable document to a destination folder. It can also detect and split multi-document PDFs into individual files using a hybrid AI pipeline.
 
 The entire stack runs inside Docker containers for portability and isolation.
 
@@ -57,7 +57,7 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
   - XMP metadata is present
   - Document catalog conforms to ISO 19005-2
 
-### FR-03: OCR via GLM-OCR on Ollama
+### FR-03: OCR via Tesseract or GLM-OCR on Ollama
 - Each page of the document is rendered to a high-resolution image (300 DPI default)
 - The page image is sent to **GLM-OCR** running on a local Ollama instance
 - GLM-OCR returns recognized text with per-word or per-line bounding boxes
@@ -96,20 +96,37 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 
 ### FR-09: Docker Deployment
 - Single `docker-compose up` to start the entire stack
-- Three services: `docuforge-app` (web app), `ollama-ocr` (GLM-OCR), `ollama-tagger` (rename/tag LLM) — or one Ollama serving both models
+- Two services: `docuforge-app` (web app) + `ollama` (serves both OCR and tagging models)
 - Persistent volumes for uploads, output, and Ollama models
 - Health checks on all services
 - Auto-pull required models on first run
 
----
+### FR-10: Smart PDF Splitting
+- PDFs with multiple documents are auto-detected and split into individual files
+- **Hybrid detection engine** — fast heuristics (blank pages, page number resets, header changes) combined with vision model verification for ambiguous boundaries
+- Heuristic pass uses Tesseract OCR on footer/header regions at low DPI — zero LLM cost
+- Vision model pass sends page contact sheets to Ollama vision model for document-type/layout boundary detection
+- **Confidence-gated approval** — high-confidence boundaries auto-accept; low-confidence boundaries pause for user review
+- **Blank page removal** — detected blank pages (separators and noise) are stripped from child documents
+- Splitting uses `pikepdf` to extract page ranges into child PDFs
+- Original multi-doc PDF preserved alongside split children for audit trail
+- Configurable minimum page threshold — splitting only offered for PDFs with ≥N pages
+- Split detection DPI is independent of processing DPI (lower for speed)
+
+### FR-11: Batch Approval
+- Split preview shows all detected documents in a table with checkboxes and a select-all toggle
+- Each row displays: thumbnail, proposed name, page count, confidence level, editable tags
+- User can batch-approve, merge adjacent documents, or adjust individual split points
+- **Batch approve endpoint** (`POST /api/jobs/batch-approve`) finalizes multiple `awaiting_approval` jobs in one action — applies to both split children and individual rename/tag approvals
+- Jobs approved via batch skip the individual preview modal flow
 
 ## 5. Non-Functional Requirements
 
 | ID | Requirement | Detail |
 |----|-------------|--------|
 | NFR-01 | **Privacy** | All processing is local. No data leaves the Docker network. |
-| NFR-02 | **Performance** | One A4 page at 300 DPI should OCR in <1 second on consumer GPU |
-| NFR-03 | **Reliability** | Failed pages should not break the entire document; partial output saved |
+| NFR-02 | **Performance** | One A4 page at 300 DPI should OCR in <1s on consumer GPU (Tesseract ~2-5s on CPU). Split detection for 200 pages should complete heuristic pass in <60s. |
+| NFR-03 | **Reliability** | Failed pages should not break the entire document; partial output saved. Split detection failures fall back to manual boundary input. |
 | NFR-04 | **Scalability** | Queue-based processing; multiple files handled sequentially |
 | NFR-05 | **Portability** | Runs on any host with Docker + GPU (or CPU fallback for Ollama) |
 | NFR-06 | **Compliance** | PDF/A output validates against VeraPDF |
@@ -128,19 +145,15 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 │  └─────────────┘     │   Port: 8080             │  │
 │                      └───────────┬──────────────┘  │
 │                                  │                  │
-│           ┌──────────────────────┼──────────┐       │
-│           │                      │          │       │
-│  ┌────────▼───────┐   ┌──────────▼───────┐  │       │
-│  │   ollama       │   │   ollama         │  │       │
-│  │   (GLM-OCR)    │   │   (llama3.2/mistral) │       │
-│  │   OCR engine   │   │   Rename & Tag   │  │       │
-│  └────────────────┘   └──────────────────┘  │       │
-│  Both on Port: 11434 (internal)              │       │
+│                      ┌───────────▼──────────┐       │
+│                      │   ollama              │       │
+│                      │   (GLM-OCR + Llama)   │       │
+│                      │   Port: 11434         │       │
+│                      └───────────────────────┘       │
 │                                                    │
 │  Volumes:                                          │
-│    /data/uploads   ← input files                   │
-│    /data/output    ← processed PDF/A+OCR files     │
-│    /data/ollama    ← model cache                   │
+│    ./data/  →  /data/ (uploads, output, settings)  │
+│    ollama-data → /root/.ollama (model cache)       │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -151,18 +164,23 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
 | Web framework | **FastAPI** (Python 3.11+) | Async, modern, file-upload friendly |
-| PDF/A conversion | **pikepdf** + **Pillow** | Lightweight, no Ghostscript dependency |
-| Image→PDF | **img2pdf** | Lossless image-to-PDF embedding |
-| OCR engine | **GLM-OCR** via **Ollama** | Local, no cloud, state-of-the-art accuracy |
-| Text layering | **pypdf** / **reportlab** | Programmatic text overlay |
-| Font embedding | **pikepdf** | PDF/A compliance |
-| Frontend | **Vanilla HTML/CSS/JS** | Zero build step, minimal dependencies |
+| PDF/A conversion | **pikepdf** | Lightweight, no Ghostscript dependency |
+| Image to PDF | **img2pdf** | Lossless image-to-PDF embedding |
+| PDF rendering | **pdf2image** + **Poppler** | Render PDF pages to PNG |
+| OCR engine | **Tesseract** (CPU) or **GLM-OCR** via **Ollama** | Local, no cloud, dual-engine |
+| Text layering | **pikepdf** | Invisible text overlay at bounding box positions |
+| Renaming & tagging | **llama3.2 / mistral / phi4** via **Ollama** | LLM-powered document classification |
+| Split detection | **Tesseract** (heuristics) + **Vision model** via **Ollama** | Hybrid boundary detection for multi-doc PDFs |
+| PDF splitting | **pikepdf** | Page extraction and blank page removal |
+| Frontend | **Vanilla HTML/CSS/JS** | Zero build step, single-page app |
 | Container | **Docker** + **docker-compose** | One-command deployment |
 | GPU support | **NVIDIA Container Toolkit** | GPU passthrough to Ollama |
 
 ---
 
 ## 8. Data Flow
+
+### Standard Pipeline (single documents, images)
 
 ```
 1. User uploads file (PDF or image)
@@ -174,35 +192,75 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 3. If image → convert to PDF (img2pdf)
        │
        ▼
-4. Render each page to PNG @ 300 DPI (pdf2image)
+4. Render each page to PNG @ configured DPI (pdf2image)
        │
        ▼
-5. Send page image to Ollama GLM-OCR API
+5. OCR each page via configured engine (Tesseract or GLM-OCR via Ollama)
        │
        ▼
-6. Receive JSON: {text, words: [{text, bbox}]}
+6. Receive JSON: {full_text, words: [{text, bbox}], tier}
        │
        ▼
 7. Convert original to PDF/A (pikepdf)
        │
        ▼
-8. Layer OCR text onto PDF/A using bounding boxes (pypdf)
+8. Layer OCR text invisibly onto PDF/A using bounding boxes (pikepdf)
        │
        ▼
-9. Extract OCR'd plain text → send to LLM with user prompt for renaming & tagging
+9. (Optional) Extract OCR'd plain text → send to LLM for renaming & tagging
        │
        ▼
-10. LLM returns {"filename": "...", "tags": ["...", "..."]}
+10. LLM returns suggested filename + up to 5 tags
        │
        ▼
-11. Embed tags into PDF/A XMP metadata
+11. Embed tags into PDF/A XMP metadata (dc:subject, docuforge:tags, pdf:Keywords)
        │
        ▼
-12. Save to /data/output/{llm_generated_name}_ocr.pdf
+12. Save to /data/output/ — rename if AUTO_RENAME enabled, else await approval
        │
        ▼
-13. Show download link + job history in UI (with tags)
+13. Show download link + job history in UI (with tags, preview, approve controls)
 ```
+
+### Split Pipeline (multi-document PDFs)
+
+```
+1. Upload multi-doc PDF
+       │
+       ▼
+2. If pages ≥ split_min_pages → enter split detection
+       │
+       ▼
+3. Render all pages at split_dpi (e.g., 150 DPI)
+       │
+       ├── 3a. Heuristic pass (Tesseract — free)
+       │       ├─ Blank page detection (pixel variance)
+       │       ├─ Page number reset (OCR footer 15%)
+       │       └─ Header change (OCR header 10%)
+       │       → Candidate boundaries + blank page list
+       │
+       └── 3b. Vision model pass (Ollama — for gaps)
+               └─ Send page contact sheets (10-page batches)
+               → Fill in missed boundaries, assign confidence
+       │
+       ▼
+4. Merge results → boundaries with confidence scores
+       │
+       ▼
+5. Job enters "awaiting_split_approval"
+       │
+       ▼
+6. User reviews split preview (batch table with checkboxes)
+       ├─ Adjusts boundaries, merges docs, edits names
+       └─ Clicks "Approve All" or "Approve Selected"
+       │
+       ▼
+7. PDF physically split into child PDFs (pikepdf)
+       ├─ Blank pages stripped from children
+       └─ Original preserved as {name}_source.pdf
+       │
+       ▼
+8. Each child job enters standard pipeline (steps 3–13 above)
 
 ---
 
@@ -212,16 +270,27 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 |--------|------|-------------|
 | `GET` | `/` | Web UI |
 | `POST` | `/api/upload` | Upload file(s) for processing |
-| `GET` | `/api/jobs` | List all processing jobs |
+| `GET` | `/api/jobs` | List all processing jobs (paginated) |
 | `GET` | `/api/jobs/{id}` | Get job status & details |
 | `GET` | `/api/download/{id}` | Download processed file |
-| `POST` | `/api/config` | Update configuration |
 | `GET` | `/api/config` | Get current configuration |
+| `POST` | `/api/config` | Update configuration (persisted to disk) |
 | `GET` | `/api/health` | Health check (includes Ollama status) |
-| `POST` | `/api/jobs/{id}/rename` | Regenerate name/tags with a new LLM prompt |
-| `PUT` | `/api/jobs/{id}/metadata` | Manually edit filename and tags |
 | `GET` | `/api/jobs/{id}/preview` | Get OCR text + proposed name/tags for approval |
+| `POST` | `/api/jobs/{id}/rename` | Regenerate name/tags with custom prompt |
+| `PUT` | `/api/jobs/{id}/metadata` | Manually edit filename and tags |
 | `GET` | `/api/tags` | List all unique tags across all jobs |
+| `POST` | `/api/jobs/{id}/retry` | Retry a failed job |
+| `GET` | `/api/config/test-ollama` | Test Ollama connectivity |
+| `GET` | `/api/watcher/status` | Folder watcher status |
+| `POST` | `/api/watcher/start` | Start folder watcher |
+| `POST` | `/api/watcher/stop` | Stop folder watcher |
+| `GET` | `/api/logs` | Recent application events |
+| `POST` | `/api/jobs/{id}/split-detect` | Run split boundary detection |
+| `GET` | `/api/jobs/{id}/split-preview` | Get boundaries + thumbnails + proposed names |
+| `PUT` | `/api/jobs/{id}/split-points` | Adjust split boundaries |
+| `POST` | `/api/jobs/{id}/split-confirm` | Confirm splits → create child jobs |
+| `POST` | `/api/jobs/batch-approve` | Finalize metadata for multiple awaiting jobs |
 
 ---
 
@@ -230,24 +299,33 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OLLAMA_HOST` | `http://ollama:11434` | Ollama API endpoint |
-| `OCR_MODEL` | `glm-ocr` | Ollama model name for OCR |
-| `DPI` | `300` | Rendering DPI for OCR |
-| `PDFA_LEVEL` | `2b` | PDF/A conformance level |
+| `OCR_MODEL` | `glm-ocr` | Ollama vision model for OCR |
+| `OCR_ENGINE` | `tesseract` | OCR backend: `tesseract` (CPU) or `glm-ocr` (Ollama) |
+| `TAGGING_MODEL` | `llama3.2` | Ollama model for renaming & tagging |
+| `DPI` | `300` | Rendering DPI for OCR (72–600) |
+| `PDFA_LEVEL` | `2b` | PDF/A conformance level (`2b` or `3b`) |
 | `UPLOAD_FOLDER` | `/data/uploads` | Input directory |
 | `OUTPUT_FOLDER` | `/data/output` | Output directory |
-| `MAX_FILE_SIZE_MB` | `100` | Max upload size |
-| `WATCH_INTERVAL` | `5` | Folder watch interval in seconds |
-| `TAGGING_MODEL` | `llama3.2` | Ollama model used for renaming & tagging |
-| `RENAME_PROMPT` | *(see code)* | Default prompt template for renaming & tagging |
-| `AUTO_RENAME` | `true` | If false, user must approve name/tags before finalizing |
+| `MAX_FILE_SIZE_MB` | `100` | Max upload size (1–500) |
+| `WATCH_INTERVAL` | `5` | Folder watch interval in seconds (1–60) |
+| `RENAME_PROMPT` | *(see .env.example)* | Prompt template — must contain `{ocr_text}` |
+| `AUTO_RENAME` | `false` | If false, user must approve name/tags before finalizing |
+| `OLLAMA_AUTO_PULL` | `true` | Auto-pull models on first container boot |
+| `OLLAMA_AUTO_PULL_MODELS` | `glm-ocr,llama3.2` | Comma-separated model names to pull |
+| `SPLIT_ENGINE` | `hybrid` | Split detection: `heuristic` (Tesseract only), `hybrid` (Tesseract + vision), `off` |
+| `SPLIT_DPI` | `150` | Rendering DPI for split detection (lower = faster) |
+| `SPLIT_CONFIDENCE` | `0.7` | Auto-accept split boundaries above this confidence |
+| `SPLIT_MODEL` | `glm-ocr` | Vision model for boundary detection |
+| `SPLIT_MIN_PAGES` | `3` | Only offer splitting for PDFs with ≥ this many pages |
 
 ---
 
-## 11. Future Enhancements (Phase 2)
+## 11. Future Enhancements (Phase 3)
 
-- Batch processing with parallel page OCR
-- Multi-language support (GLM-OCR handles this natively)
+- Parallel page OCR for multi-page documents
+- Multi-language OCR support
 - VeraPDF auto-validation of PDF/A output
+- vLLM integration for higher-quality GLM-OCR (see `GLM-OCR_vLLM_plan.md`)
 - Webhook notifications on job completion
 - User authentication (Basic Auth / OIDC)
 - S3 / WebDAV output targets
@@ -258,7 +336,9 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 ## 12. Success Metrics
 
 - A 10-page scanned PDF processes end-to-end in under 3 minutes
-- Output PDF passes VeraPDF PDF/A-2b validation
+- A 200-page multi-document PDF is split into individual documents in under 5 minutes
+- Split detection correctly identifies >90% of document boundaries without user intervention
+- Output PDF passes PDF/A-2b compliance
 - OCR text is selectable and copyable with >95% accuracy
 - App starts with a single `docker compose up` command
 - Zero data leaves the local Docker network
@@ -484,8 +564,9 @@ Week 1: Sprint 0 (Env) + Sprint 1 (Core Pipeline)
 Week 2: Sprint 2 (Renaming & Tagging)
 Week 3: Sprint 3 (Folder Watcher) + Sprint 4 (Config Panel)
 Week 4: Sprint 5 (Error Handling) + Sprint 6 (Deployment)
+Week 5: Sprint 7 (Smart Splitting & Batch Approval)
 ─────────────────────────────────────────────────────────
-Week 5: Buffer / Bug fixes / Polish
+Week 6: Buffer / Bug fixes / Polish
 ```
 
 ### Dependency Graph
@@ -494,8 +575,8 @@ Week 5: Buffer / Bug fixes / Polish
 Sprint 0 (P0) ──► Sprint 1 (P1) ──┬──► Sprint 2 (P2) ──► Sprint 3 (P3)
                                    │
                                    ├──► Sprint 4 (P3) ──► Sprint 5 (P3) ──► Sprint 6 (P4)
-                                   │
-                                   └──► Sprint 5 (P3) ──► Sprint 6 (P4)
+                                   │                                    │
+                                   └──► Sprint 5 (P3) ──► Sprint 7 (P1) └──► Sprint 6 (P4)
 ```
 
 - **Sprint 0** blocks everything (no app without scaffolding).
@@ -503,7 +584,23 @@ Sprint 0 (P0) ──► Sprint 1 (P1) ──┬──► Sprint 2 (P2) ──►
 - **Sprint 2** blocks Sprint 3's tag features.
 - **Sprints 3, 4, 5** can run partially in parallel after Sprint 1 is done.
 - **Sprint 6** should be the last thing before shipping.
+- **Sprint 7** depends on Sprint 5 (error handling) and Sprint 1 (core pipeline). It can run in parallel with other post-Sprint-1 work.
+
+### Sprint 7 — Smart Splitting & Batch Approval (P1 — Critical)
+
+**Goal:** Multi-document PDFs are auto-detected, split into individual documents, and batch-approved.
+
+| # | Task | File(s) | Depends On |
+|---|------|---------|------------|
+| 7.1 | Implement `SplitDetector` class — heuristic boundary detection (blank pages, page number reset, header change) | `app/splitter.py` | 1.1, 1.4 |
+| 7.2 | Implement vision model boundary detection — sends page contact sheets to Ollama for document-type/layout boundaries | `app/splitter.py` | 7.1 |
+| 7.3 | Implement `split_pdf()` — extracts page ranges into child PDFs, strips blank pages, preserves original | `app/pdf_utils.py` | 1.3 |
+| 7.4 | Add `JobData` fields: `job_type`, `parent_job_id`, `child_job_ids`, `split_boundaries`, `split_confidences`, `blank_pages_removed` | `app/processor.py` | 1.8 |
+| 7.5 | Add config fields: `split_engine`, `split_dpi`, `split_confidence`, `split_model`, `split_min_pages` with validators | `app/config.py` | 0.6 |
+| 7.6 | Implement split API routes: `POST split-detect`, `GET split-preview`, `PUT split-points`, `POST split-confirm`, `POST batch-approve` | `app/main.py` | 7.1–7.5 |
+| 7.7 | Build split preview UI — table with checkboxes, select-all, thumbnails, confidence indicators, merge/split controls | `app/templates/index.html` | 7.6 |
+| 7.8 | Build batch approve UI — select-all checkbox, approve selected, approve all, inline name/tag editing | `app/templates/index.html` | 7.6 |
 
 ---
 
-*Document Version: 1.2 | Last Updated: 2026-04-25 — Added Section 14: Implementation Plan*
+*Document Version: 1.3 | Last Updated: 2026-05-16 — Added Sprint 7 (Smart Splitting), FR-10, FR-11; fixed stale references*

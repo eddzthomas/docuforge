@@ -3,9 +3,6 @@
 > **Intelligent Document Processing Pipeline**  
 > Upload scanned PDFs & images → PDF/A with searchable OCR text — all local, no cloud.
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
-
 ---
 
 ## Quickstart
@@ -249,6 +246,4 @@ Make sure `./data` is mounted as a volume in `docker-compose.yml`. Settings are 
 
 ---
 
-## License
-
-MIT
+---
