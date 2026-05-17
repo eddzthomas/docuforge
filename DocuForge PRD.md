@@ -120,6 +120,51 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 - **Batch approve endpoint** (`POST /api/jobs/batch-approve`) finalizes multiple `awaiting_approval` jobs in one action — applies to both split children and individual rename/tag approvals
 - Jobs approved via batch skip the individual preview modal flow
 
+### FR-12: Document Classification (Pre-Split)
+- After OCR completes, the extracted plain text is sent to the **LLM** for document type classification
+- Classification types: `letter`, `invoice`, `form`, `quote`, `contract`, `report`, `other`
+- Classification uses only the first ~1000 characters of OCR text for speed (~1-2s LLM call)
+- Document type is stored on the job and displayed as a colored badge in the UI
+- Classification result determines downstream behavior:
+  - Invoices trigger **structured field extraction** (FR-14)
+  - Different document types can use **type-specific rename/tag prompts**
+  - Split detection can use document type as a heuristic hint
+- Classification failures do not block the pipeline — type defaults to `other`
+- User can override classification in the preview/approve modal
+
+### FR-13: Text Layer Quality Verification
+- After OCR bounding boxes are collected, a statistical validation step runs **before** text is layered onto the PDF/A
+- Verification checks detect catastrophic alignment failures before they reach the output:
+  - **Bounds check:** All bounding boxes must fall within page dimensions
+  - **Area sanity:** No zero-area or >90% page area bounding boxes
+  - **Position diversity:** At least 3 unique word positions (catches GLM-OCR hallucination where all words get the same coordinate)
+  - **Coverage ratio:** Text layer covers 1%–95% of page area
+  - **Font size sanity:** Computed PDF font sizes between 3–72 pt
+  - **Scale verification:** DPI-to-points conversion produces physically reasonable values
+- Scoring system (0–100) determines action:
+  - Score ≥ 80: Text layer applied normally
+  - Score 50–79: Text layer applied with `text_layer_warning` flag
+  - Score < 50: Text layer **skipped entirely**, error logged per-page
+- Verification score is stored on `JobData` and visible in job detail
+- This is a **pre-layering statistical check** — no re-rendering or re-OCR required
+
+### FR-14: Structured Field Extraction (Invoices)
+- When document type is `invoice`, a dedicated LLM extraction pass runs after classification
+- Extracts structured fields into JSON stored alongside the output PDF:
+  - `invoice_date` — Date string (YYYY-MM-DD format preferred)
+  - `total_amount` — Numeric total with currency if detected
+  - `vendor_name` — Company or individual name
+- Extracted fields saved as `{output_filename}.json` in the output directory
+- Fields displayed as an editable "Extracted Data" section in the preview/approve modal
+- Extraction failure does not block the pipeline — fields shown as "Not detected"
+- Line item extraction deferred to v2 (requires table structure detection)
+- New API endpoint: `GET /api/jobs/{id}/fields` — returns extracted JSON
+
+### FR-15: Table Detection *(Deferred — Phase 4)*
+- tabula-py and camelot extract tables from digital PDF text streams and **cannot** work on scanned/image-based PDFs
+- Vision-model table region detection and OpenCV line detection are viable approaches but too heavy for Phase 3
+- Scheduled for evaluation after structured field extraction is stabilized
+
 ## 5. Non-Functional Requirements
 
 | ID | Requirement | Detail |
@@ -130,6 +175,9 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | NFR-04 | **Scalability** | Queue-based processing; multiple files handled sequentially |
 | NFR-05 | **Portability** | Runs on any host with Docker + GPU (or CPU fallback for Ollama) |
 | NFR-06 | **Compliance** | PDF/A output validates against VeraPDF |
+| NFR-07 | **Text Layer Accuracy** | Verification step catches ≥95% of catastrophic alignment failures before output. Bounding box validation score visible in job history. |
+| NFR-08 | **Classification Speed** | Document type classification completes within 2 seconds. |
+| NFR-09 | **Field Extraction Tolerance** | Field extraction failure does not block the pipeline. Partial extraction (1-2 of 3 fields) is accepted. |
 
 ---
 
@@ -170,6 +218,9 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | OCR engine | **Tesseract** (CPU) or **GLM-OCR** via **Ollama** | Local, no cloud, dual-engine |
 | Text layering | **pikepdf** | Invisible text overlay at bounding box positions |
 | Renaming & tagging | **llama3.2 / mistral / phi4** via **Ollama** | LLM-powered document classification |
+| Classification | **llama3.2** via **Ollama** | Document type detection (invoice, contract, etc.) |
+| Field extraction | **llama3.2** via **Ollama** | Structured data extraction for invoices |
+| Text verification | **Statistical validation** | Bounding box sanity checks before PDF layering |
 | Split detection | **Tesseract** (heuristics) + **Vision model** via **Ollama** | Hybrid boundary detection for multi-doc PDFs |
 | PDF splitting | **pikepdf** | Page extraction and blank page removal |
 | Frontend | **Vanilla HTML/CSS/JS** | Zero build step, single-page app |
@@ -201,25 +252,31 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 6. Receive JSON: {full_text, words: [{text, bbox}], tier}
        │
        ▼
-7. Convert original to PDF/A (pikepdf)
+7. Document classification via LLM (invoice, contract, letter, etc.)
        │
        ▼
-8. Layer OCR text invisibly onto PDF/A using bounding boxes (pikepdf)
+8. Text layer quality verification — statistical bounding box validation
+       │  (score < 50 → skip text layer and warn; 50-79 → apply with warning)
+       ▼
+9. Convert original to PDF/A (pikepdf)
        │
        ▼
-9. (Optional) Extract OCR'd plain text → send to LLM for renaming & tagging
+10. Layer OCR text invisibly onto PDF/A using bounding boxes (pikepdf)
        │
        ▼
-10. LLM returns suggested filename + up to 5 tags
+11. If doc_type == invoice → structured field extraction via LLM
+       │  → writes {output}.json alongside PDF
+       ▼
+12. LLM renaming + tagging (optionally type-specific prompts)
        │
        ▼
-11. Embed tags into PDF/A XMP metadata (dc:subject, docuforge:tags, pdf:Keywords)
+13. Embed tags + fields into PDF/A XMP metadata
        │
        ▼
-12. Save to /data/output/ — rename if AUTO_RENAME enabled, else await approval
+14. Save to /data/output/ — rename if AUTO_RENAME enabled, else await approval
        │
        ▼
-13. Show download link + job history in UI (with tags, preview, approve controls)
+15. Show in UI with doc type badge, verification score, fields, tags
 ```
 
 ### Split Pipeline (multi-document PDFs)
@@ -291,6 +348,8 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | `PUT` | `/api/jobs/{id}/split-points` | Adjust split boundaries |
 | `POST` | `/api/jobs/{id}/split-confirm` | Confirm splits → create child jobs |
 | `POST` | `/api/jobs/batch-approve` | Finalize metadata for multiple awaiting jobs |
+| `GET` | `/api/jobs/{id}/classify` | Get or regenerate document type classification |
+| `GET` | `/api/jobs/{id}/fields` | Get extracted structured fields (invoice date, amount, vendor) |
 
 ---
 
@@ -317,11 +376,20 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | `SPLIT_CONFIDENCE` | `0.7` | Auto-accept split boundaries above this confidence |
 | `SPLIT_MODEL` | `glm-ocr` | Vision model for boundary detection |
 | `SPLIT_MIN_PAGES` | `3` | Only offer splitting for PDFs with ≥ this many pages |
+| `CLASSIFY_MODEL` | `llama3.2` | Ollama model for document type classification |
+| `VERIFY_TEXT_LAYER` | `true` | Run statistical bounding box validation before text layering |
+| `VERIFY_MIN_SCORE` | `50` | Minimum score to apply text layer (0–100). Below this, text layer is skipped. |
+| `EXTRACT_FIELDS` | `true` | Enable structured field extraction for invoices |
+| `EXTRACT_MODEL` | `llama3.2` | Ollama model for structured field extraction |
+| `RENAME_PROMPT_INVOICE` | *(see .env.example)* | Type-specific rename prompt for invoices {ocr_text} |
+| `RENAME_PROMPT_CONTRACT` | *(see .env.example)* | Type-specific rename prompt for contracts {ocr_text} |
 
 ---
 
-## 11. Future Enhancements (Phase 3)
+## 11. Future Enhancements (Phase 4+)
 
+- Table detection for scanned documents (OpenCV line detection + vision model fallback) — see FR-15
+- Structured field extraction: line items for invoices (requires table detection)
 - Parallel page OCR for multi-page documents
 - Multi-language OCR support
 - VeraPDF auto-validation of PDF/A output
@@ -565,8 +633,9 @@ Week 2: Sprint 2 (Renaming & Tagging)
 Week 3: Sprint 3 (Folder Watcher) + Sprint 4 (Config Panel)
 Week 4: Sprint 5 (Error Handling) + Sprint 6 (Deployment)
 Week 5: Sprint 7 (Smart Splitting & Batch Approval)
+Week 6: Sprint 8 (Quality & Intelligence — Classifier, Verification, Extraction)
 ─────────────────────────────────────────────────────────
-Week 6: Buffer / Bug fixes / Polish
+Week 7: Buffer / Bug fixes / Polish
 ```
 
 ### Dependency Graph
@@ -576,15 +645,18 @@ Sprint 0 (P0) ──► Sprint 1 (P1) ──┬──► Sprint 2 (P2) ──►
                                    │
                                    ├──► Sprint 4 (P3) ──► Sprint 5 (P3) ──► Sprint 6 (P4)
                                    │                                    │
-                                   └──► Sprint 5 (P3) ──► Sprint 7 (P1) └──► Sprint 6 (P4)
+                                   ├──► Sprint 7 (P1) ───┘
+                                   │
+                                   └──► Sprint 8 (P2) ──► Classification + Verification + Extraction
 ```
 
 - **Sprint 0** blocks everything (no app without scaffolding).
-- **Sprint 1** blocks Sprints 2–6 (no processing pipeline to extend).
+- **Sprint 1** blocks Sprints 2–8 (no processing pipeline to extend).
 - **Sprint 2** blocks Sprint 3's tag features.
 - **Sprints 3, 4, 5** can run partially in parallel after Sprint 1 is done.
 - **Sprint 6** should be the last thing before shipping.
-- **Sprint 7** depends on Sprint 5 (error handling) and Sprint 1 (core pipeline). It can run in parallel with other post-Sprint-1 work.
+- **Sprint 7** depends on Sprint 5 (error handling) and Sprint 1 (core pipeline).
+- **Sprint 8** depends on Sprint 1 (core pipeline) and Sprint 2 (Ollama integration patterns). Phase 3 within Sprint 8 (Field Extraction) depends on Phase 1 (Classifier). Phases 1 and 2 can run in parallel.
 
 ### Sprint 7 — Smart Splitting & Batch Approval (P1 — Critical)
 
@@ -603,4 +675,50 @@ Sprint 0 (P0) ──► Sprint 1 (P1) ──┬──► Sprint 2 (P2) ──►
 
 ---
 
-*Document Version: 1.3 | Last Updated: 2026-05-16 — Added Sprint 7 (Smart Splitting), FR-10, FR-11; fixed stale references*
+### Sprint 8 — Quality & Intelligence Layer (P2 — High)
+
+**Goal:** Document classification, text layer verification, and structured field extraction for invoices.
+
+This sprint has three independent phases. Phase 3 depends on Phase 1.
+
+#### Phase 8.1: Document Classifier
+
+| # | Task | File(s) | Depends On |
+|---|------|---------|------------|
+| 8.1.1 | Implement `classify_document()` — sends first ~1000 chars of OCR text to Ollama, returns document type enum | `app/tagger.py` (or `app/classifier.py`) | 2.1 |
+| 8.1.2 | Add `doc_type` field to `JobData` | `app/processor.py` | 1.8 |
+| 8.1.3 | Insert classification step into `process_file()` pipeline — runs after OCR, before PDF/A conversion | `app/processor.py` | 8.1.1, 8.1.2 |
+| 8.1.4 | Add config fields: `CLASSIFY_MODEL` (default: `llama3.2`) | `app/config.py` | 0.6 |
+| 8.1.5 | Add `GET /api/jobs/{id}/classify` — get or regenerate classification | `app/main.py` | 8.1.1 |
+| 8.1.6 | Build classification badge in job history table (colored chip per doc type) | `app/templates/index.html` | 8.1.3 |
+| 8.1.7 | Add type-specific rename prompts: `RENAME_PROMPT_INVOICE`, `RENAME_PROMPT_CONTRACT` in settings | `app/config.py` | 8.1.3 |
+| 8.1.8 | Log classification events + expose in job details | `app/processor.py` | 8.1.3 |
+
+#### Phase 8.2: Text Layer Quality Verification
+
+| # | Task | File(s) | Depends On |
+|---|------|---------|------------|
+| 8.2.1 | Implement `validate_text_layer()` — statistical bounding box checks returning {valid, score, warnings} | `app/verifier.py` (new) | 1.5 |
+| 8.2.2 | Add `text_layer_score` and `text_layer_warnings` fields to `JobData` | `app/processor.py` | 1.8 |
+| 8.2.3 | Insert verification step into `process_file()` pipeline — runs after OCR, before text layering | `app/processor.py` | 8.2.1, 8.2.2 |
+| 8.2.4 | Gate text layering on score: ≥80 apply, 50-79 apply with warning, <50 skip | `app/processor.py` | 8.2.3 |
+| 8.2.5 | Add config fields: `VERIFY_TEXT_LAYER` (default: `true`), `VERIFY_MIN_SCORE` (default: `50`) | `app/config.py` | 0.6 |
+| 8.2.6 | Build verification score indicator in job history table row | `app/templates/index.html` | 8.2.3 |
+| 8.2.7 | Log verification events (pass / warn / skip) with detailed warnings | `app/verifier.py` | 8.2.1 |
+
+#### Phase 8.3: Structured Field Extraction
+
+| # | Task | File(s) | Depends On |
+|---|------|---------|------------|
+| 8.3.1 | Implement `extract_invoice_fields()` — LLM prompt to extract date, total_amount, vendor_name from OCR text | `app/tagger.py` (or `app/extractor.py`) | 8.1.1, 2.1 |
+| 8.3.2 | Add `extracted_fields` field to `JobData` | `app/processor.py` | 1.8 |
+| 8.3.3 | Insert extraction step into pipeline — runs after classification, only when `doc_type == invoice` | `app/processor.py` | 8.3.1, 8.3.2 |
+| 8.3.4 | Write extracted fields as `{output_filename}.json` alongside output PDF | `app/processor.py` | 8.3.3 |
+| 8.3.5 | Add config fields: `EXTRACT_FIELDS` (default: `true`), `EXTRACT_MODEL` (default: `llama3.2`) | `app/config.py` | 0.6 |
+| 8.3.6 | Add `GET /api/jobs/{id}/fields` — return extracted JSON | `app/main.py` | 8.3.3 |
+| 8.3.7 | Build "Extracted Data" section in preview/approve modal — editable date, amount, vendor fields | `app/templates/index.html` | 8.3.6 |
+| 8.3.8 | Log extraction events + expose in job detail view | `app/processor.py` | 8.3.3 |
+
+---
+
+*Document Version: 1.4 | Last Updated: 2026-05-16 — Added Sprint 8 (Quality & Intelligence), FR-12 through FR-15; deferred table detection; updated API endpoints and config table*

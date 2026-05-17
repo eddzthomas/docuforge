@@ -28,8 +28,9 @@ app/
   config.py     -- Settings (env vars → pydantic → settings.json override)
   processor.py  -- Pipeline orchestrator, JobManager, JobQueue, folder watcher
   ocr.py        -- OCR dispatch: tesseract (CPU) or GLM-OCR via Ollama
-  tagger.py     -- LLM rename + tag via Ollama
-  pdf_utils.py  -- PDF/A conversion (pikepdf), text layering (pypdf), tag embedding
+  tagger.py     -- LLM rename + tag + classify + field extraction via Ollama
+  verifier.py   -- Statistical bounding-box validation before text layering
+  pdf_utils.py  -- PDF/A conversion (pikepdf), text layering (pikepdf), tag embedding
   templates/index.html  -- Single-page web UI (vanilla JS, zero build step)
   static/style.css
 ```
@@ -43,7 +44,11 @@ Volumes: `./data/` → `/data/` (persists uploads, output, settings.json).
 - `get_settings()` is cached via `@lru_cache()`. After POST `/api/config`, must call `reload_settings()` to bust the cache.
 - `RENAME_PROMPT` **must** contain `{ocr_text}` placeholder — validated by pydantic field validator.
 - `ocr_engine` defaults to `"tesseract"` (CPU). Set to `"glm-ocr"` for Ollama vision model.
-- Web UI Settings tab only exposes editable fields: `ollama_host`, `ocr_model`, `ocr_engine`, `tagging_model`, `dpi`, `pdfa_level`, `auto_rename`, `rename_prompt`, `max_file_size_mb`, `watch_interval`. Path fields (`upload_folder`, `output_folder`) are NOT editable via UI.
+- Text layer verification is on by default (`VERIFY_TEXT_LAYER=true`). Stats-only check — no re-rendering. Score < `VERIFY_MIN_SCORE` (default 50) skips text layer for that page.
+- Document classification runs on first ~1000 chars of OCR text. Doc types: `letter`, `invoice`, `form`, `quote`, `contract`, `report`, `other`.
+- Structured field extraction ONLY fires for `doc_type == "invoice"`. Extracts 3 fields: invoice_date, total_amount, vendor_name. No line items (v2).
+- Type-specific rename prompts: `RENAME_PROMPT_INVOICE`, `RENAME_PROMPT_CONTRACT` (optional). Each must contain `{ocr_text}`. Falls back to generic `RENAME_PROMPT`.
+- Web UI Settings tab only exposes editable fields: `ollama_host`, `ocr_model`, `ocr_engine`, `tagging_model`, `dpi`, `pdfa_level`, `auto_rename`, `rename_prompt`, `max_file_size_mb`, `watch_interval`, `verify_text_layer`, `verify_min_score`, `extract_fields`. Path fields (`upload_folder`, `output_folder`) are NOT editable via UI.
 
 ## Processing pipeline (one-at-a-time)
 
@@ -51,10 +56,13 @@ Volumes: `./data/` → `/data/` (persists uploads, output, settings.json).
 2. Image files are converted to interim PDF via `img2pdf` before processing.
 3. PDF pages are rendered to PNG at configured DPI via poppler (`pdf2image`).
 4. OCR on each page is dispatched to the selected engine. Per-page failures are tracked but don't abort the pipeline.
-5. PDF/A-2b conversion uses `pikepdf` (strips JS, embedded files, sets XMP metadata).
-6. OCR text is layered invisibly (Tr=3) onto the PDF/A with Helvetica font.
-7. If `AUTO_RENAME=false` (default), job pauses at `awaiting_approval` — user must approve name/tags via UI.
-8. Tags are embedded in XMP metadata (`dc:subject`, `pdf:Keywords`) and in `docuforge:tags` custom namespace.
+5. **Document classification** — sends first ~1000 chars of OCR text to LLM for doc type detection (invoice, contract, letter, etc.). Stored on `JobData.doc_type`.
+6. **Text layer verification** — statistical bounding box checks run before layering. Score 0-100 gates whether text is applied. New module: `app/verifier.py`.
+7. PDF/A-2b conversion uses `pikepdf` (strips JS, embedded files, sets XMP metadata).
+8. OCR text is layered invisibly (Tr=3) onto the PDF/A with Helvetica font.
+9. **Structured field extraction** — if `doc_type == "invoice"`, LLM extracts date, total_amount, vendor_name. Saved as `.json` alongside output PDF.
+10. If `AUTO_RENAME=false` (default), job pauses at `awaiting_approval` — user must approve name/tags via UI.
+11. Tags are embedded in XMP metadata (`dc:subject`, `pdf:Keywords`) and in `docuforge:tags` custom namespace.
 
 ## File conventions
 
