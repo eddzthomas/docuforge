@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     verify_text_layer: bool = True
     verify_min_score: int = 50
 
+    # Sprint 8 — Structured field extraction
+    extract_fields: bool = True
+    extract_model: str = "llama3.2"
+
     # ---- Allowed file extensions ----
     allowed_extensions: set[str] = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 
@@ -259,6 +263,7 @@ def get_editable_fields() -> list[str]:
         "rename_prompt_contract",
         "verify_text_layer",
         "verify_min_score",
+        "extract_fields",
         "max_file_size_mb",
         "watch_interval",
     ]

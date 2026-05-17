@@ -342,6 +342,26 @@ async def preview_job(job_id: str):
         "ocr_full_text": job.ocr_full_text,
         "proposed_name": job.proposed_name,
         "proposed_tags": job.proposed_tags,
+        "doc_type": job.doc_type,
+        "extracted_fields": job.extracted_fields,
+    })
+
+
+@app.get("/api/jobs/{job_id}/fields")
+async def get_fields(job_id: str):
+    """
+    Return extracted structured fields for an invoice job.
+
+    Returns 404 if the job doesn't exist.
+    Returns empty fields dict if extraction wasn't run.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    return JSONResponse({
+        "doc_type": job.doc_type,
+        "fields": job.extracted_fields or {},
     })
 
 

@@ -516,6 +516,25 @@ header p {
     cursor: help;
 }
 
+/* ---- Extracted fields in preview modal ---- */
+.extracted-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.field-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.field-row label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
 /* ---- Pagination ---- */
 .pagination {
     display: flex;

@@ -9,6 +9,7 @@ process_file() is called as a background task from the API route.
 """
 
 import asyncio
+import json
 import logging
 import shutil
 import tempfile
@@ -25,7 +26,7 @@ from pdf2image import convert_from_path
 from app.config import Settings, get_settings
 from app.ocr import ocr_page, OCRError
 from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf, embed_tags_in_pdf
-from app.tagger import generate_filename, generate_tags, sanitize_filename, classify_document, TaggingError
+from app.tagger import generate_filename, generate_tags, sanitize_filename, classify_document, extract_invoice_fields, TaggingError
 from app.verifier import validate_text_layer
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,8 @@ class JobData:
         # Sprint 8 — Text layer verification
         self.text_layer_score: Optional[int] = None
         self.text_layer_warnings: list[str] = []
+        # Sprint 8 — Structured field extraction
+        self.extracted_fields: Optional[dict] = None
 
     def to_dict(self) -> dict:
         """
@@ -121,6 +124,7 @@ class JobData:
             "doc_type": self.doc_type,
             "text_layer_score": self.text_layer_score,
             "text_layer_warnings": self.text_layer_warnings,
+            "extracted_fields": self.extracted_fields,
         }
 
 
@@ -425,6 +429,28 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 f"verification score {verify_result['score']} below minimum {settings.verify_min_score}"
             )
             pdfa_tmp.rename(output_path)
+
+        # ---- Step 5.5: Extract structured fields (invoices only) ----
+        extracted_fields = {}
+        if (
+            settings.extract_fields
+            and doc_type == "invoice"
+            and ocr_full_text
+            and settings.tagging_model
+        ):
+            try:
+                extracted_fields = await extract_invoice_fields(ocr_full_text, settings)
+                log_event("info", f"Fields extracted: invoice_date={extracted_fields.get('invoice_date', '')}", job_id)
+            except Exception as exc:
+                logger.warning(f"Field extraction failed (non-blocking): {exc}")
+                extracted_fields = {}
+
+        # Write extracted fields as .json alongside output PDF
+        if extracted_fields:
+            fields_path = output_path.with_suffix(".json")
+            fields_path.write_text(json.dumps(extracted_fields, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        job_manager.update_job(job_id, extracted_fields=extracted_fields)
 
         # ---- Step 6: Generate name & tags via LLM (independently optional) ----
         proposed_name = file_path.stem

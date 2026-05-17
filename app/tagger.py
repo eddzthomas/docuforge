@@ -302,3 +302,91 @@ def sanitize_filename(raw: str, extension: str = ".pdf") -> str:
         name = name[:max_stem].rstrip("_")
 
     return name + extension
+
+
+EXTRACT_FIELDS_PROMPT = (
+    "Extract the following fields from this invoice text.\n"
+    "Return ONLY a valid JSON object with these exact keys, "
+    "no markdown, no explanation:\n"
+    '{{"invoice_date": "", "total_amount": "", "vendor_name": ""}}\n\n'
+    "Invoice text:\n{ocr_text}"
+)
+
+
+async def extract_invoice_fields(ocr_text: str, settings: Settings) -> dict:
+    """
+    Extract structured fields from invoice OCR text via LLM.
+
+    Only extracts 3 fields: invoice_date, total_amount, vendor_name.
+    Line items are deferred to v2.
+
+    Args:
+        ocr_text: Full OCR text from the invoice document.
+        settings: Application settings.
+
+    Returns:
+        dict with keys: invoice_date, total_amount, vendor_name.
+        Values are strings; empty string if field not found.
+        Returns all-empty dict on any failure.
+    """
+    if not ocr_text or not ocr_text.strip():
+        return {}
+
+    truncated = ocr_text[:MAX_OCR_TEXT_LENGTH].strip()
+
+    try:
+        raw = await _call_ollama(
+            EXTRACT_FIELDS_PROMPT.format(ocr_text=truncated),
+            settings,
+            model=getattr(settings, "extract_model", settings.tagging_model),
+            use_json_format=True,
+        )
+        return _parse_fields(raw)
+    except TaggingError:
+        return {}
+    except json.JSONDecodeError:
+        logger.warning("Field extraction returned invalid JSON")
+        return {}
+    except Exception:
+        logger.exception("Field extraction raised unexpected error")
+        return {}
+
+
+def _parse_fields(raw: str) -> dict:
+    """
+    Parse structured field extraction JSON with defensive fallback tiers.
+
+    Tier 1: Direct JSON parse
+    Tier 2: Strip markdown wrappers, then parse
+    Tier 3: Return all-empty dict
+    """
+    # Tier 1: Direct JSON parse
+    try:
+        data = json.loads(raw)
+        return {
+            "invoice_date": str(data.get("invoice_date", "")).strip(),
+            "total_amount": str(data.get("total_amount", "")).strip(),
+            "vendor_name": str(data.get("vendor_name", "")).strip(),
+        }
+    except json.JSONDecodeError:
+        pass
+
+    # Tier 2: Strip markdown wrappers
+    cleaned = raw.strip()
+    for prefix in ("```json", "```"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+    try:
+        data = json.loads(cleaned)
+        return {
+            "invoice_date": str(data.get("invoice_date", "")).strip(),
+            "total_amount": str(data.get("total_amount", "")).strip(),
+            "vendor_name": str(data.get("vendor_name", "")).strip(),
+        }
+    except json.JSONDecodeError:
+        pass
+
+    logger.warning(f"Could not parse field extraction response: {raw[:200]}")
+    return {}

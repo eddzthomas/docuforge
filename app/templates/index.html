@@ -856,6 +856,35 @@ async function openPreviewModal(jobId) {
     // Truncate OCR text for display (first 2000 chars)
     const ocrPreview = (preview.ocr_full_text || '').substring(0, 2000);
 
+    // Build extracted fields section (invoices only)
+    let extractedHtml = '';
+    if (preview.doc_type === 'invoice' && preview.extracted_fields && Object.keys(preview.extracted_fields).length > 0) {
+        const f = preview.extracted_fields;
+        extractedHtml = `
+            <details open style="margin-bottom:12px;">
+                <summary style="cursor:pointer;color:var(--text-secondary);font-size:0.8rem;font-weight:600;">
+                    Extracted Data (Invoice)
+                </summary>
+                <div class="extracted-fields" style="margin-top:8px;">
+                    <div class="field-row">
+                        <label>Invoice Date</label>
+                        <input type="text" id="extracted-date" class="modal-input"
+                               value="${escapeHtml(f.invoice_date || '')}" placeholder="YYYY-MM-DD">
+                    </div>
+                    <div class="field-row">
+                        <label>Total Amount</label>
+                        <input type="text" id="extracted-amount" class="modal-input"
+                               value="${escapeHtml(f.total_amount || '')}" placeholder="$0.00">
+                    </div>
+                    <div class="field-row">
+                        <label>Vendor</label>
+                        <input type="text" id="extracted-vendor" class="modal-input"
+                               value="${escapeHtml(f.vendor_name || '')}" placeholder="Company name">
+                    </div>
+                </div>
+            </details>`;
+    }
+
     // Build modal HTML
     modalContent.innerHTML = `
         <h3>Preview & Approve — ${escapeHtml(preview.proposed_name || 'Untitled')}</h3>
@@ -873,6 +902,8 @@ async function openPreviewModal(jobId) {
                    style="flex:1;">
             <button class="btn btn-sm" onclick="addModalTag()">Add</button>
         </div>
+
+        ${extractedHtml}
 
         <details style="margin-top:12px;">
             <summary style="cursor:pointer;color:var(--text-secondary);font-size:0.8rem;">
