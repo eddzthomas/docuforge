@@ -26,6 +26,7 @@ from app.config import Settings, get_settings
 from app.ocr import ocr_page, OCRError
 from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf, embed_tags_in_pdf
 from app.tagger import generate_filename, generate_tags, sanitize_filename, classify_document, TaggingError
+from app.verifier import validate_text_layer
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,9 @@ class JobData:
         self.skip_tags: bool = False
         # Sprint 8 — Document classification
         self.doc_type: Optional[str] = None
+        # Sprint 8 — Text layer verification
+        self.text_layer_score: Optional[int] = None
+        self.text_layer_warnings: list[str] = []
 
     def to_dict(self) -> dict:
         """
@@ -115,6 +119,8 @@ class JobData:
             "page_errors": self.page_errors,
             "pdfa_saved": self.pdfa_saved,
             "doc_type": self.doc_type,
+            "text_layer_score": self.text_layer_score,
+            "text_layer_warnings": self.text_layer_warnings,
         }
 
 
@@ -243,6 +249,28 @@ def pdf_to_images(pdf_path: Path, dpi: int) -> list[Path]:
     return image_paths
 
 
+def _get_page_dims(image_paths: list[Path]) -> list[tuple[int, int]]:
+    """
+    Get pixel dimensions from rendered page images.
+
+    Args:
+        image_paths: List of paths to rendered page PNGs.
+
+    Returns:
+        List of (width_px, height_px) tuples, one per page.
+    """
+    from PIL import Image
+
+    dims = []
+    for path in image_paths:
+        try:
+            with Image.open(path) as img:
+                dims.append(img.size)  # (width, height)
+        except Exception:
+            dims.append((0, 0))
+    return dims
+
+
 # ---- Full Processing Pipeline ----
 async def process_file(job_id: str, file_path: Path, settings: Settings | None = None):
     """
@@ -309,6 +337,9 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
         if total_pages == 0:
             raise ValueError("PDF contains zero renderable pages")
 
+        # Collect rendered page pixel dimensions for text layer verification
+        page_pixel_dims = _get_page_dims(page_images)
+
         # ---- Step 3: OCR each page ----
         ocr_results = []
         tier_summary = {"word": 0, "line": 0, "full_page": 0, "skip": 0}
@@ -359,15 +390,41 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 doc_type = "other"
         job_manager.update_job(job_id, doc_type=doc_type)
 
+        # ---- Step 3.6: Verify text layer quality ----
+        verify_result = {"valid": True, "score": 100, "warnings": [], "page_scores": []}
+        if settings.verify_text_layer:
+            try:
+                verify_result = validate_text_layer(ocr_results, settings.dpi, page_pixel_dims)
+                job_manager.update_job(
+                    job_id,
+                    text_layer_score=verify_result["score"],
+                    text_layer_warnings=verify_result["warnings"],
+                )
+                if verify_result["score"] < settings.verify_min_score:
+                    log_event("warn", f"Text layer skipped: score {verify_result['score']} < {settings.verify_min_score}", job_id)
+                elif verify_result["warnings"]:
+                    log_event("warn", f"Text layer applied with warnings: score {verify_result['score']}", job_id)
+                else:
+                    log_event("info", f"Text layer verified: score {verify_result['score']}", job_id)
+            except Exception as exc:
+                logger.warning(f"Verification check failed (non-blocking): {exc}")
+
         # ---- Step 4: Convert to PDF/A ----
         output_filename = f"{file_path.stem}_ocr.pdf"
         pdfa_tmp = job_tmp / f"{file_path.stem}_pdfa.pdf"
         convert_to_pdfa(pdf_path, pdfa_tmp, settings.pdfa_level)
         pdfa_saved = True  # From here on, we have a valid PDF/A for partial output
 
-        # ---- Step 5: Layer OCR text onto PDF/A ----
+        # ---- Step 5: Layer OCR text onto PDF/A (gated by verification) ----
         output_path = Path(settings.output_folder) / output_filename
-        layer_text_on_pdf(pdfa_tmp, ocr_results, output_path, settings.dpi)
+        if verify_result["score"] >= settings.verify_min_score:
+            layer_text_on_pdf(pdfa_tmp, ocr_results, output_path, settings.dpi)
+        else:
+            logger.warning(
+                f"Job {job_id}: Skipping text layer — "
+                f"verification score {verify_result['score']} below minimum {settings.verify_min_score}"
+            )
+            pdfa_tmp.rename(output_path)
 
         # ---- Step 6: Generate name & tags via LLM (independently optional) ----
         proposed_name = file_path.stem

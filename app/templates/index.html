@@ -492,6 +492,15 @@ function renderJobHistory(data) {
                 </div>`;
         }
 
+        // Build verification score indicator
+        let verifyHtml = '';
+        if (job.text_layer_score != null && (job.status === 'done' || job.status === 'awaiting_approval')) {
+            const score = job.text_layer_score;
+            const color = score >= 80 ? 'var(--success)' : (score >= 50 ? 'var(--warning)' : 'var(--danger)');
+            const icon = score >= 80 ? '\\2705' : (score >= 50 ? '\\26A0' : '\\274C');
+            verifyHtml = `<span class="verify-score" style="color:${color}" title="${(job.text_layer_warnings||[]).join('\\n')}">${icon} ${score}</span>`;
+        }
+
         // Build doc type badge
         const typeColors = {
             invoice: '#f59e0b', contract: '#3b82f6', letter: '#10b981',
@@ -639,6 +648,7 @@ function renderJobHistory(data) {
                 <td>
                     <span class="status-badge ${statusClass}">${statusLabel}</span>
                     ${progressHtml}
+                    ${verifyHtml}
                 </td>
                 <td>${typeHtml}</td>
                 <td>${tagsHtml}</td>

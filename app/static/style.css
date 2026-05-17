@@ -503,52 +503,17 @@ header p {
 
 .job-progress-text {
     display: block;
-    font-size: 0.65rem;
+    font-size: 0.7rem;
     color: var(--text-muted);
     margin-top: 2px;
 }
 
-/* ---- Logs Tab ---- */
-.log-list {
-    max-height: 500px;
-    overflow-y: auto;
-}
-
-.log-entry {
-    padding: 6px 8px;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.78rem;
-    font-family: var(--mono);
-    display: flex;
-    gap: 8px;
-    align-items: baseline;
-}
-
-.log-time {
-    color: var(--text-muted);
-    font-size: 0.7rem;
-    white-space: nowrap;
-    min-width: 75px;
-}
-
-.log-level {
+.verify-score {
+    display: inline-block;
+    font-size: 0.75rem;
     font-weight: 600;
-    text-transform: uppercase;
-    font-size: 0.65rem;
-    min-width: 50px;
-}
-
-.log-level.info  { color: var(--accent); }
-.log-level.warn  { color: var(--warning); }
-.log-level.error { color: var(--danger); }
-
-.log-msg {
-    color: var(--text-secondary);
-    word-break: break-word;
-}
-
-.log-clear {
-    margin-bottom: 8px;
+    margin-left: 6px;
+    cursor: help;
 }
 
 /* ---- Pagination ---- */

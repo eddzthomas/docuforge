@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     rename_prompt_invoice: Optional[str] = None
     rename_prompt_contract: Optional[str] = None
 
+    # Sprint 8 — Text layer quality verification
+    verify_text_layer: bool = True
+    verify_min_score: int = 50
+
     # ---- Allowed file extensions ----
     allowed_extensions: set[str] = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 
@@ -253,6 +257,8 @@ def get_editable_fields() -> list[str]:
         "rename_prompt",
         "rename_prompt_invoice",
         "rename_prompt_contract",
+        "verify_text_layer",
+        "verify_min_score",
         "max_file_size_mb",
         "watch_interval",
     ]
