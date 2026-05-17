@@ -286,6 +286,17 @@ header p {
 .status-done                { background: rgba(63, 185, 80, 0.15); color: var(--success); }
 .status-failed              { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
 
+/* ---- Doc type badge ---- */
+.type-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: capitalize;
+    white-space: nowrap;
+}
+
 /* ---- Tags ---- */
 .tag {
     display: inline-block;

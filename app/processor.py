@@ -25,7 +25,7 @@ from pdf2image import convert_from_path
 from app.config import Settings, get_settings
 from app.ocr import ocr_page, OCRError
 from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf, embed_tags_in_pdf
-from app.tagger import generate_filename, generate_tags, sanitize_filename, TaggingError
+from app.tagger import generate_filename, generate_tags, sanitize_filename, classify_document, TaggingError
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,8 @@ class JobData:
         # Sprint 7 — Skip tagging/renaming
         self.skip_rename: bool = False
         self.skip_tags: bool = False
+        # Sprint 8 — Document classification
+        self.doc_type: Optional[str] = None
 
     def to_dict(self) -> dict:
         """
@@ -112,6 +114,7 @@ class JobData:
             "ocr_full_text": self.ocr_full_text,
             "page_errors": self.page_errors,
             "pdfa_saved": self.pdfa_saved,
+            "doc_type": self.doc_type,
         }
 
 
@@ -344,6 +347,17 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
 
         # Store OCR full text for Sprint 2 (renaming & tagging)
         ocr_full_text = "\n\n".join(all_text_parts)
+
+        # ---- Step 3.5: Classify document type ----
+        doc_type = "other"
+        if ocr_full_text and settings.tagging_model:
+            try:
+                doc_type = await classify_document(ocr_full_text, settings)
+                log_event("info", f"Document classified: {doc_type}", job_id)
+            except Exception as exc:
+                logger.warning(f"Classification failed (non-blocking): {exc}")
+                doc_type = "other"
+        job_manager.update_job(job_id, doc_type=doc_type)
 
         # ---- Step 4: Convert to PDF/A ----
         output_filename = f"{file_path.stem}_ocr.pdf"

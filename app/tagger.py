@@ -23,6 +23,15 @@ logger = logging.getLogger(__name__)
 
 MAX_OCR_TEXT_LENGTH = 4000
 MAX_TAGS = 5
+MAX_CLASSIFY_TEXT_LENGTH = 1000
+
+DOC_TYPES = frozenset({"letter", "invoice", "form", "quote", "contract", "report", "other"})
+
+CLASSIFY_PROMPT = (
+    "Classify this document as exactly one of: letter, invoice, form, "
+    "quote, contract, report, other. Return ONLY the single word, "
+    "no punctuation, no explanation.\n\nDocument text:\n{ocr_text}"
+)
 
 
 class TaggingError(Exception):
@@ -124,15 +133,55 @@ async def generate_tags(
     return _parse_tag_array(raw)
 
 
-async def _call_ollama(prompt: str, settings: Settings) -> str:
+async def classify_document(
+    ocr_text: str,
+    settings: Settings,
+) -> str:
+    """
+    Classify document type from OCR text via LLM.
+
+    Sends only the first 1000 characters for speed (~1s on llama3.2).
+    Returns one of the DOC_TYPES values, or "other" on any failure.
+
+    Args:
+        ocr_text: Raw OCR output text.
+        settings: Application settings.
+
+    Returns:
+        One of: letter, invoice, form, quote, contract, report, other.
+    """
+    if not ocr_text or not ocr_text.strip():
+        return "other"
+
+    truncated = ocr_text[:MAX_CLASSIFY_TEXT_LENGTH].strip()
+
+    try:
+        raw = await _call_ollama(
+            CLASSIFY_PROMPT.format(ocr_text=truncated),
+            settings,
+            model=getattr(settings, "classify_model", settings.tagging_model),
+            use_json_format=False,
+        )
+    except TaggingError:
+        return "other"
+
+    result = raw.strip().lower().rstrip(".")
+    if result not in DOC_TYPES:
+        logger.warning(f"Classify returned unrecognized type: '{raw[:100]}' — falling back to 'other'")
+        return "other"
+    return result
+
+
+async def _call_ollama(prompt: str, settings: Settings, model: str | None = None, use_json_format: bool = True) -> str:
     """Send a prompt to Ollama and return the raw response text."""
     payload = {
-        "model": settings.tagging_model,
+        "model": model or settings.tagging_model,
         "prompt": prompt,
         "stream": False,
-        "format": "json",
         "options": {"temperature": 0.0},
     }
+    if use_json_format:
+        payload["format"] = "json"
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:

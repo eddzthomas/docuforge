@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     ocr_model: str = "glm-ocr"
     ocr_engine: str = "tesseract"  # "tesseract" (CPU) or "glm-ocr" (Ollama vision model)
     tagging_model: str = "llama3.2"
+    classify_model: str = "llama3.2"  # Sprint 8 — model for document classification
 
     # ---- Processing ----
     dpi: int = 300
@@ -60,6 +61,9 @@ class Settings(BaseSettings):
         '{"filename": "suggested_name", "tags": ["tag1", "tag2", "tag3"]}\n\n'
         "Document text:\n{ocr_text}"
     )
+    # Sprint 8 — Type-specific rename prompts (optional, fall back to rename_prompt)
+    rename_prompt_invoice: Optional[str] = None
+    rename_prompt_contract: Optional[str] = None
 
     # ---- Allowed file extensions ----
     allowed_extensions: set[str] = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
@@ -114,6 +118,16 @@ class Settings(BaseSettings):
         v = v.strip()
         if "{ocr_text}" not in v:
             raise ValueError("Rename prompt must contain the {ocr_text} placeholder")
+        return v
+
+    @field_validator("rename_prompt_invoice", "rename_prompt_contract")
+    @classmethod
+    def validate_type_specific_prompts(cls, v: str | None) -> str | None:
+        """Type-specific prompts are optional, but if set must contain {ocr_text}."""
+        if v is not None:
+            v = v.strip()
+            if v and "{ocr_text}" not in v:
+                raise ValueError("Type-specific rename prompt must contain the {ocr_text} placeholder")
         return v
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
@@ -232,10 +246,13 @@ def get_editable_fields() -> list[str]:
         "ocr_model",
         "ocr_engine",
         "tagging_model",
+        "classify_model",
         "dpi",
         "pdfa_level",
         "auto_rename",
         "rename_prompt",
+        "rename_prompt_invoice",
+        "rename_prompt_contract",
         "max_file_size_mb",
         "watch_interval",
     ]
