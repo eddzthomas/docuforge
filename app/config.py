@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     extract_fields: bool = True
     extract_model: str = "llama3.2"
 
+    # Sprint 7 — Smart PDF splitting
+    split_engine: str = "hybrid"  # "heuristic", "hybrid", or "off"
+    split_dpi: int = 150
+    split_confidence: float = 0.7
+    split_model: str = "glm-ocr"
+    split_min_pages: int = 3
+
     # ---- Allowed file extensions ----
     allowed_extensions: set[str] = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 
@@ -136,6 +143,39 @@ class Settings(BaseSettings):
             v = v.strip()
             if v and "{ocr_text}" not in v:
                 raise ValueError("Type-specific rename prompt must contain the {ocr_text} placeholder")
+        return v
+
+    @field_validator("split_dpi")
+    @classmethod
+    def validate_split_dpi(cls, v: int) -> int:
+        """Split detection DPI must be between 72 and 600."""
+        if not 72 <= v <= 600:
+            raise ValueError(f"Split DPI must be between 72 and 600, got {v}")
+        return v
+
+    @field_validator("split_confidence")
+    @classmethod
+    def validate_split_confidence(cls, v: float) -> float:
+        """Split confidence must be between 0 and 1."""
+        if not 0 <= v <= 1:
+            raise ValueError(f"Split confidence must be between 0 and 1, got {v}")
+        return v
+
+    @field_validator("split_min_pages")
+    @classmethod
+    def validate_split_min_pages(cls, v: int) -> int:
+        """Split minimum pages must be at least 2."""
+        if v < 2:
+            raise ValueError(f"Split min pages must be at least 2, got {v}")
+        return v
+
+    @field_validator("split_engine")
+    @classmethod
+    def validate_split_engine(cls, v: str) -> str:
+        """Split engine must be one of: heuristic, hybrid, off."""
+        v = v.strip().lower()
+        if v not in ("heuristic", "hybrid", "off"):
+            raise ValueError(f"Split engine must be heuristic, hybrid, or off, got '{v}'")
         return v
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
@@ -264,6 +304,10 @@ def get_editable_fields() -> list[str]:
         "verify_text_layer",
         "verify_min_score",
         "extract_fields",
+        "split_engine",
+        "split_dpi",
+        "split_confidence",
+        "split_min_pages",
         "max_file_size_mb",
         "watch_interval",
     ]

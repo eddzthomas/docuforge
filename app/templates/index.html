@@ -539,6 +539,8 @@ function renderJobHistory(data) {
                 <button class="btn btn-sm btn-primary" onclick="openPreviewModal('${job.id}')">Preview</button>
                 <button class="btn btn-sm" onclick="quickApprove('${job.id}')" style="margin-left:4px;" title="Approve with suggested name/tags">Approve</button>
             `;
+        } else if (job.status === 'awaiting_split_approval') {
+            actionsHtml = `<button class="btn btn-sm btn-primary" onclick="openSplitPreview('${job.id}')">Review Splits (${(job.split_boundaries?.length || 0) + 1} docs)</button>`;
         } else if (job.status === 'failed') {
             // Build error detail row ID for toggling
             const detailId = `detail-${job.id}`;
@@ -832,6 +834,87 @@ modalOverlay.addEventListener('click', (e) => {
 
 function closeModal() {
     modalOverlay.classList.remove('open');
+}
+
+// ---- Split Preview Modal ----
+async function openSplitPreview(jobId) {
+    let preview;
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-preview`);
+        if (!res.ok) { showToast('Failed to load split preview', 'error'); return; }
+        preview = await res.json();
+    } catch (err) { showToast('Network error', 'error'); return; }
+
+    modalContent.innerHTML = `
+        <h3>Split Preview — ${preview.total_pages} pages</h3>
+        <p style="color:var(--text-muted);font-size:0.8rem;margin-bottom:12px">
+            Detected ${preview.children.length} sub-documents. Review and adjust before confirming.
+        </p>
+        <table class="job-table" style="margin-bottom:12px;">
+            <thead><tr>
+                <th>#</th><th>Pages</th><th>Page Count</th><th>Confidence</th><th>Status</th>
+            </tr></thead>
+            <tbody>
+                ${preview.children.map(c => `
+                    <tr>
+                        <td>Doc ${c.index}</td>
+                        <td>${c.start_page}–${c.end_page}</td>
+                        <td>${c.page_count}</td>
+                        <td>${Math.round(c.confidence * 100)}%</td>
+                        <td>${c.auto_approved
+                            ? '<span style="color:var(--success)">high confidence</span>'
+                            : '<span style="color:var(--warning)">review needed</span>'}</td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+        <details style="margin-bottom:12px;">
+            <summary style="cursor:pointer;font-size:0.8rem;color:var(--text-secondary)">Adjust Boundaries</summary>
+            <p style="font-size:0.7rem;color:var(--text-muted)">Comma-separated 0-based page indices.<br>Example: 3,7,12 splits at pages 4, 8, 13</p>
+            <input type="text" id="split-adjust-input" class="modal-input"
+                   value="${(preview.boundaries || []).join(',')}"
+                   style="width:100%;margin-top:4px;">
+            <button class="btn btn-sm" onclick="adjustSplits('${jobId}')" style="margin-top:6px;">Update</button>
+        </details>
+        <div class="modal-actions">
+            <button class="btn" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="confirmSplit('${jobId}')">Confirm & Split</button>
+        </div>
+    `;
+    modalOverlay.classList.add('open');
+}
+
+async function adjustSplits(jobId) {
+    const input = document.getElementById('split-adjust-input');
+    if (!input) return;
+    const boundaries = input.value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-points`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({boundaries}),
+        });
+        if (res.ok) {
+            showToast('Boundaries updated', 'info');
+            openSplitPreview(jobId); // Refresh
+        } else {
+            showToast('Failed to update boundaries', 'error');
+        }
+    } catch (err) { showToast('Network error', 'error'); }
+}
+
+async function confirmSplit(jobId) {
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-confirm`, {method: 'POST'});
+        if (res.ok) {
+            const data = await res.json();
+            showToast(`Split into ${data.child_count} documents`, 'success');
+            closeModal();
+            refreshJobs();
+        } else {
+            const err = await res.json();
+            showToast(err.detail || 'Failed to confirm split', 'error');
+        }
+    } catch (err) { showToast('Network error', 'error'); }
 }
 
 // Open the preview modal for a job awaiting approval

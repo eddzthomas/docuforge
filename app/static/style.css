@@ -285,6 +285,7 @@ header p {
 .status-awaiting-approval   { background: rgba(210, 153, 34, 0.15); color: var(--warning); }
 .status-done                { background: rgba(63, 185, 80, 0.15); color: var(--success); }
 .status-failed              { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
+.status-awaiting-split-approval { background: rgba(139, 92, 246, 0.15); color: #8b5cf6; }
 
 /* ---- Doc type badge ---- */
 .type-badge {

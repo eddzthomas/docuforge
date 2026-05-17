@@ -483,3 +483,75 @@ def _ensure_srgb_colorspace(pdf):
         cs_dict["/DefaultRGB"] = Array([Name.CalRGB, srgb_cal])
         resources["/ColorSpace"] = cs_dict
         page.Resources = resources
+
+
+# ---------------------------------------------------------------------------
+# PDF Splitting
+# ---------------------------------------------------------------------------
+
+
+def split_pdf(
+    input_pdf: Path,
+    boundaries: list[int],
+    output_dir: Path,
+    base_name: str,
+    blank_pages: list[int] | None = None,
+) -> list[Path]:
+    """
+    Split a PDF into child documents at specified page boundaries.
+
+    Uses pikepdf to extract page ranges. Blank pages are stripped
+    from child documents.
+
+    Args:
+        input_pdf: Path to the source multi-document PDF.
+        boundaries: List of 0-based page indices where splits occur.
+            Example: [2, 5] splits into pages [0,1], [2,3,4], [5,...].
+        output_dir: Directory to write child PDFs into.
+        base_name: Stem of the original file name for child naming.
+        blank_pages: Optional list of 0-based blank page indices to remove
+            from child documents after splitting.
+
+    Returns:
+        List of Path objects for the generated child PDF files, in order.
+    """
+    logger.info(f"Splitting PDF: {input_pdf.name} with boundaries {boundaries}")
+
+    pdf = pikepdf.open(input_pdf)
+    total_pages = len(pdf.pages)
+    blank_set = set(blank_pages) if blank_pages else set()
+
+    if not boundaries:
+        ranges = [(0, total_pages)]
+    else:
+        ranges = []
+        start = 0
+        for boundary in boundaries:
+            boundary = min(max(boundary, 0), total_pages)
+            if boundary > start:
+                ranges.append((start, boundary))
+            start = boundary
+        if start < total_pages:
+            ranges.append((start, total_pages))
+
+    output_paths: list[Path] = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for part_num, (rng_start, rng_end) in enumerate(ranges, start=1):
+        child_pdf = pikepdf.Pdf.new()
+        for page_idx in range(rng_start, rng_end):
+            if page_idx in blank_set:
+                logger.debug(f"Skipping blank page {page_idx} in part {part_num}")
+                continue
+            child_pdf.pages.append(pdf.pages[page_idx])
+
+        page_count = len(child_pdf.pages)
+        output_path = output_dir / f"{base_name}_part{part_num}.pdf"
+        child_pdf.save(output_path)
+        child_pdf.close()
+        output_paths.append(output_path)
+        logger.info(f"Created part {part_num}: {output_path.name} ({page_count} pages)")
+
+    pdf.close()
+    logger.info(f"Split complete: {len(output_paths)} child documents")
+    return output_paths

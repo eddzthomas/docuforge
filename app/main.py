@@ -8,6 +8,7 @@ Defines routes, mounts static files, and serves the UI.
 import asyncio
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -720,3 +721,222 @@ async def get_logs(limit: int = 100):
         limit: Max number of events to return (default 100).
     """
     return JSONResponse(get_recent_events(limit=min(limit, 500)))
+
+
+# =============================================================================
+# Sprint 7: Smart PDF Splitting
+# =============================================================================
+
+
+@app.post("/api/jobs/{job_id}/split-detect")
+async def run_split_detection(job_id: str):
+    """
+    Manually trigger split boundary detection on a specific job.
+
+    Re-renders pages at split_dpi and runs the detection engine.
+    Returns the detected boundaries and confidences.
+    """
+    settings = get_settings()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    if not job.file_path:
+        raise HTTPException(status_code=400, detail="Job has no file path — cannot re-detect")
+
+    from app.splitter import SplitDetector
+    from app.processor import pdf_to_images
+
+    file_path = Path(job.file_path)
+    if not file_path.suffix.lower() == ".pdf":
+        raise HTTPException(status_code=400, detail="Split detection only available for PDF files")
+
+    # Render at split DPI
+    split_images = pdf_to_images(file_path, settings.split_dpi)
+    detector = SplitDetector(settings)
+    split_result = await detector.detect(file_path, split_images, settings)
+
+    # Save thumbnails for preview
+    from app.processor import _save_split_thumbnails
+    job_tmp = Path(tempfile.mkdtemp(prefix=f"docuforge_{job_id}_"))
+    if split_result.get("boundaries"):
+        _save_split_thumbnails(split_images, split_result["boundaries"], job_tmp, job_id)
+
+    job_manager.update_job(job_id,
+        split_boundaries=split_result.get("boundaries", []),
+        split_confidences=split_result.get("confidences", []),
+        blank_pages_removed=split_result.get("blank_pages", []),
+    )
+
+    return JSONResponse(split_result)
+
+
+@app.get("/api/jobs/{job_id}/split-preview")
+async def get_split_preview(job_id: str):
+    """
+    Return split preview data: boundaries, confidences, and first-page
+    thumbnail info for each detected child document.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    if not job.split_boundaries:
+        return JSONResponse({"boundaries": [], "confidences": [], "children": []})
+
+    # Build child document ranges
+    boundaries = job.split_boundaries
+    confidences = job.split_confidences
+    children = []
+    start = 0
+    for i, b in enumerate(boundaries):
+        if b > start:
+            confidence = confidences[i] if i < len(confidences) else 0.5
+            children.append({
+                "index": len(children) + 1,
+                "start_page": start + 1,  # 1-indexed for display
+                "end_page": b,
+                "page_count": b - start,
+                "confidence": confidence,
+                "auto_approved": confidence >= get_settings().split_confidence,
+            })
+        start = b
+    if start < (job.pages or 0):
+        children.append({
+            "index": len(children) + 1,
+            "start_page": start + 1,
+            "end_page": job.pages,
+            "page_count": (job.pages or 0) - start,
+            "confidence": confidences[-1] if confidences else 0.5,
+            "auto_approved": False,
+        })
+
+    return JSONResponse({
+        "boundaries": boundaries,
+        "confidences": confidences,
+        "children": children,
+        "total_pages": job.pages,
+    })
+
+
+@app.put("/api/jobs/{job_id}/split-points")
+async def adjust_split_points(job_id: str, body: dict):
+    """
+    Adjust the detected split boundaries manually.
+
+    Body: {"boundaries": [3, 7, 12]} — new 0-based page indices.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    new_boundaries = body.get("boundaries", [])
+    if not isinstance(new_boundaries, list) or not all(isinstance(b, int) for b in new_boundaries):
+        raise HTTPException(status_code=400, detail="boundaries must be a list of integers")
+
+    new_boundaries = sorted(set(b for b in new_boundaries if 0 < b < (job.pages or float("inf"))))
+    job_manager.update_job(job_id, split_boundaries=new_boundaries, split_confidences=[])
+
+    return JSONResponse({"boundaries": new_boundaries, "adjusted": True})
+
+
+@app.post("/api/jobs/{job_id}/split-confirm")
+async def confirm_splits(job_id: str):
+    """
+    Confirm split boundaries → physically split PDF and create child jobs.
+    Each child enters the standard processing pipeline.
+    """
+    settings = get_settings()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    if not job.file_path:
+        raise HTTPException(status_code=400, detail="Job has no file path")
+    if not job.split_boundaries:
+        raise HTTPException(status_code=400, detail="No split boundaries defined")
+
+    from app.pdf_utils import split_pdf
+
+    file_path = Path(job.file_path)
+    child_paths = split_pdf(
+        file_path,
+        job.split_boundaries,
+        Path(settings.output_folder),
+        file_path.stem,
+        job.blank_pages_removed,
+    )
+
+    # Create child jobs and enqueue
+    child_ids = []
+    for i, child_path in enumerate(child_paths):
+        child_job = job_manager.create_job(child_path.name)
+        child_job.job_type = "split_child"
+        child_job.parent_job_id = job_id
+        child_ids.append(child_job.id)
+        job_queue.enqueue(child_job.id, child_path.resolve())
+
+    job_manager.update_job(job_id,
+        status=JobStatus.DONE,
+        child_job_ids=child_ids,
+    )
+    log_event("info", f"Split confirmed: {len(child_paths)} child documents created", job_id)
+
+    return JSONResponse({
+        "child_job_ids": child_ids,
+        "child_count": len(child_paths),
+    })
+
+
+@app.post("/api/jobs/batch-approve")
+async def batch_approve(body: dict):
+    """
+    Finalize metadata for multiple awaiting jobs in one action.
+
+    Body: {"approvals": [{"id": "...", "filename": "...", "tags": [...]}, ...]}
+    """
+    job_ids = body.get("job_ids", [])
+    if not isinstance(job_ids, list) or not job_ids:
+        raise HTTPException(status_code=400, detail="job_ids must be a non-empty list")
+
+    approved_count = 0
+    errors = []
+    for jid in job_ids:
+        job = job_manager.get_job(jid)
+        if not job:
+            errors.append(f"{jid}: not found")
+            continue
+        if job.status not in (JobStatus.AWAITING_APPROVAL, JobStatus.AWAITING_SPLIT_APPROVAL):
+            errors.append(f"{jid}: not in awaiting_approval state")
+            continue
+
+        # Finalize the job
+        output_dir = Path(get_settings().output_folder)
+        proposed = job.proposed_name or Path(job.original_name).stem
+        final_name = sanitize_filename(proposed)
+        final_path = output_dir / final_name
+
+        # Rename output file if needed
+        if job.output_filename:
+            current_path = output_dir / job.output_filename
+            if current_path.exists() and current_path != final_path:
+                current_path.rename(final_path)
+                embed_tags_in_pdf(final_path, job.proposed_tags or job.tags, title=proposed)
+                job_manager.update_job(jid,
+                    output_filename=final_name,
+                    status=JobStatus.DONE,
+                    tags=job.proposed_tags or job.tags,
+                )
+            else:
+                embed_tags_in_pdf(current_path, job.proposed_tags or job.tags, title=proposed)
+                job_manager.update_job(jid,
+                    status=JobStatus.DONE,
+                    tags=job.proposed_tags or job.tags,
+                )
+        else:
+            job_manager.update_job(jid, status=JobStatus.DONE)
+
+        approved_count += 1
+        log_event("info", f"Batch approved: {job.original_name}", jid)
+
+    return JSONResponse({
+        "approved": approved_count,
+        "errors": errors,
+    })

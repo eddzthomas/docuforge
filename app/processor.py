@@ -11,6 +11,7 @@ process_file() is called as a background task from the API route.
 import asyncio
 import json
 import logging
+import pikepdf
 import shutil
 import tempfile
 import threading
@@ -25,9 +26,10 @@ from pdf2image import convert_from_path
 
 from app.config import Settings, get_settings
 from app.ocr import ocr_page, OCRError
-from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf, embed_tags_in_pdf
+from app.pdf_utils import image_to_pdf, convert_to_pdfa, layer_text_on_pdf, embed_tags_in_pdf, split_pdf
 from app.tagger import generate_filename, generate_tags, sanitize_filename, classify_document, extract_invoice_fields, TaggingError
 from app.verifier import validate_text_layer
+from app.splitter import SplitDetector
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ class JobStatus(str, Enum):
     QUEUED = "queued"
     PROCESSING = "processing"
     AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_SPLIT_APPROVAL = "awaiting_split_approval"
     DONE = "done"
     FAILED = "failed"
 
@@ -99,6 +102,13 @@ class JobData:
         self.text_layer_warnings: list[str] = []
         # Sprint 8 — Structured field extraction
         self.extracted_fields: Optional[dict] = None
+        # Sprint 7 — Smart PDF splitting
+        self.job_type: str = "standard"  # "standard" or "split_child"
+        self.parent_job_id: Optional[str] = None
+        self.child_job_ids: list[str] = []
+        self.split_boundaries: list[int] = []
+        self.split_confidences: list[float] = []
+        self.blank_pages_removed: list[int] = []
 
     def to_dict(self) -> dict:
         """
@@ -125,6 +135,12 @@ class JobData:
             "text_layer_score": self.text_layer_score,
             "text_layer_warnings": self.text_layer_warnings,
             "extracted_fields": self.extracted_fields,
+            "job_type": self.job_type,
+            "parent_job_id": self.parent_job_id,
+            "child_job_ids": self.child_job_ids,
+            "split_boundaries": self.split_boundaries,
+            "split_confidences": self.split_confidences,
+            "blank_pages_removed": self.blank_pages_removed,
         }
 
 
@@ -275,6 +291,51 @@ def _get_page_dims(image_paths: list[Path]) -> list[tuple[int, int]]:
     return dims
 
 
+def _save_split_thumbnails(
+    page_images: list[Path],
+    boundaries: list[int],
+    output_dir: Path,
+    job_id: str,
+):
+    """
+    Save first-page thumbnails of each detected split child for the UI preview.
+
+    Creates small PNG thumbnails (200px wide) of the first page of each
+    detected sub-document. Saved to the job temp directory.
+
+    Args:
+        page_images: Rendered page images at split_dpi.
+        boundaries: List of 0-based page indices where splits occur.
+        output_dir: Directory to save thumbnail PNGs into.
+        job_id: Job ID for naming.
+    """
+    from PIL import Image
+
+    # Build child page ranges from boundaries
+    ranges = []
+    start = 0
+    for b in boundaries:
+        if b > start:
+            ranges.append((start, b))
+        start = b
+    if start < len(page_images):
+        ranges.append((start, len(page_images)))
+
+    thumbnail_dir = output_dir / f"split_thumbnails_{job_id[:8]}"
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, (pg_start, pg_end) in enumerate(ranges):
+        first_page = page_images[pg_start]
+        try:
+            with Image.open(first_page) as img:
+                img.thumbnail((200, 200), Image.LANCZOS)
+                thumb_path = thumbnail_dir / f"child_{i + 1}.png"
+                img.save(thumb_path, "PNG")
+                logger.debug(f"Saved split thumbnail: {thumb_path.name}")
+        except Exception as exc:
+            logger.warning(f"Failed to create thumbnail for child {i + 1}: {exc}")
+
+
 # ---- Full Processing Pipeline ----
 async def process_file(job_id: str, file_path: Path, settings: Settings | None = None):
     """
@@ -332,6 +393,71 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
             pdf_path = file_path
         else:
             raise ValueError(f"Unsupported file type: {suffix}")
+
+        # ---- Step 1.5: Split detection (PDFs only) ----
+        split_result = None
+        if suffix == ".pdf" and settings.split_engine != "off":
+            try:
+                # Get page count without rendering (fast)
+                with pikepdf.open(pdf_path) as tmp_pdf:
+                    pdf_page_count = len(tmp_pdf.pages)
+
+                if pdf_page_count >= settings.split_min_pages:
+                    log_event("info", f"Running split detection ({settings.split_engine}): {pdf_path.name}", job_id)
+                    # Render pages at split DPI (lower than processing DPI for speed)
+                    split_images = pdf_to_images(pdf_path, settings.split_dpi)
+                    detector = SplitDetector(settings)
+                    split_result = await detector.detect(pdf_path, split_images, settings)
+
+                    if split_result and split_result.get("boundaries"):
+                        boundaries = split_result["boundaries"]
+                        confidences = split_result["confidences"]
+                        blank_pages = split_result.get("blank_pages", [])
+                        # Check auto-approval vs manual review
+                        high_conf = [c for c in confidences if c >= settings.split_confidence]
+                        if len(high_conf) == len(confidences) and settings.auto_rename:
+                            # All high confidence + auto_rename → auto-split
+                            log_event("info", f"Auto-splitting: {len(boundaries)} boundaries (all high confidence)", job_id)
+                            child_paths = split_pdf(pdf_path, boundaries, Path(settings.output_folder),
+                                                    file_path.stem, blank_pages)
+                            job_manager.update_job(job_id,
+                                job_type="split_parent",
+                                split_boundaries=boundaries,
+                                split_confidences=confidences,
+                                blank_pages_removed=blank_pages,
+                            )
+                            # Create child jobs
+                            child_ids = []
+                            for i, child_path in enumerate(child_paths):
+                                child_job = job_manager.create_job(child_path.name)
+                                child_job.job_type = "split_child"
+                                child_job.parent_job_id = job_id
+                                child_ids.append(child_job.id)
+                                job_queue.enqueue(child_job.id, child_path.resolve())
+                            job_manager.update_job(job_id,
+                                status=JobStatus.DONE,
+                                child_job_ids=child_ids,
+                                pages=pdf_page_count,
+                            )
+                            return  # Parent done, children process separately
+                        else:
+                            # Manual approval needed
+                            log_event("info", f"Split detection found {len(boundaries)} boundaries — awaiting approval", job_id)
+                            job_manager.update_job(job_id,
+                                pages=pdf_page_count,
+                                job_type="split_parent",
+                                split_boundaries=boundaries,
+                                split_confidences=confidences,
+                                blank_pages_removed=blank_pages,
+                            )
+                            # Save split preview images for UI (first page thumbnails)
+                            _save_split_thumbnails(split_images, boundaries, job_tmp, job_id)
+                            job_manager.update_job(job_id, status=JobStatus.AWAITING_SPLIT_APPROVAL)
+                            log_event("info", f"Awaiting split approval: {file_path.name} ({len(boundaries)} documents)", job_id)
+                            return
+            except Exception as exc:
+                logger.warning(f"Split detection failed (non-blocking): {exc}")
+                log_event("warn", f"Split detection failed, proceeding as single doc: {exc}", job_id)
 
         # ---- Step 2: Render pages to images ----
         page_images = pdf_to_images(pdf_path, settings.dpi)
