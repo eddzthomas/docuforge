@@ -42,13 +42,19 @@ class TaggingError(Exception):
 async def generate_filename(
     ocr_text: str,
     settings: Settings,
+    doc_type: str | None = None,
 ) -> str:
     """
     Ask the LLM to suggest a descriptive filename from OCR text.
 
+    Uses type-specific rename prompts if document type is known
+    and a matching prompt is configured.
+
     Args:
         ocr_text: The full OCR'd text from the document.
         settings: Application settings (tagging model, Ollama host).
+        doc_type: Optional document type for prompt selection
+            (e.g. "invoice", "contract").
 
     Returns:
         Suggested filename (without extension), sanitized for filesystem.
@@ -61,13 +67,7 @@ async def generate_filename(
 
     truncated = ocr_text[:MAX_OCR_TEXT_LENGTH].strip()
 
-    prompt = (
-        "Analyze the following document text and suggest a concise, "
-        "descriptive filename (without extension, max 150 chars, "
-        "use underscores between words). Include the date if present. "
-        "Return ONLY a single filename string, no JSON, no explanation.\n\n"
-        f"Document text:\n{truncated}"
-    )
+    prompt = _build_rename_prompt(truncated, settings, doc_type)
 
     raw = await _call_ollama(prompt, settings)
 
@@ -76,6 +76,37 @@ async def generate_filename(
     if not name:
         return "untitled"
     return name[:200]
+
+
+def _build_rename_prompt(ocr_text: str, settings: Settings, doc_type: str | None = None) -> str:
+    """
+    Select the appropriate rename prompt based on document type.
+
+    Priority:
+        1. Type-specific prompt (rename_prompt_invoice / _contract)
+        2. Default config prompt (rename_prompt)
+        3. Hardcoded fallback
+    """
+    # Check type-specific prompt first
+    if doc_type and doc_type in ("invoice", "contract"):
+        type_prompt = getattr(settings, f"rename_prompt_{doc_type}", None)
+        if type_prompt and type_prompt.strip():
+            return type_prompt.format(ocr_text=ocr_text)
+
+    # Fall back to configured rename prompt
+    try:
+        return settings.rename_prompt.format(ocr_text=ocr_text)
+    except Exception:
+        pass
+
+    # Hardcoded fallback
+    return (
+        "Analyze the following document text and suggest a concise, "
+        "descriptive filename (without extension, max 150 chars, "
+        "use underscores between words). Include the date if present. "
+        "Return ONLY a single filename string, no JSON, no explanation.\n\n"
+        f"Document text:\n{ocr_text}"
+    )
 
 
 def _extract_filename(raw: str) -> str:
@@ -101,13 +132,18 @@ def _extract_filename(raw: str) -> str:
 async def generate_tags(
     ocr_text: str,
     settings: Settings,
+    doc_type: str | None = None,
 ) -> list[str]:
     """
     Ask the LLM to suggest up to 5 tags from OCR text.
 
+    Uses type-specific rename prompts if document type is known
+    and a matching prompt is configured.
+
     Args:
         ocr_text: The full OCR'd text from the document.
         settings: Application settings (tagging model, Ollama host).
+        doc_type: Optional document type for prompt selection.
 
     Returns:
         List of up to 5 tag strings.
@@ -120,17 +156,38 @@ async def generate_tags(
 
     truncated = ocr_text[:MAX_OCR_TEXT_LENGTH].strip()
 
-    prompt = (
+    # Try type-specific prompt for tags from the rename prompt config
+    tag_prompt = _build_tag_prompt(truncated, settings, doc_type)
+
+    raw = await _call_ollama(tag_prompt, settings)
+
+    return _parse_tag_array(raw)
+
+
+def _build_tag_prompt(ocr_text: str, settings: Settings, doc_type: str | None = None) -> str:
+    """
+    Build a tag suggestion prompt, using type-specific prompts if available.
+    """
+    # Try type-specific rename prompt (might contain tag instructions too)
+    if doc_type and doc_type in ("invoice", "contract"):
+        type_prompt = getattr(settings, f"rename_prompt_{doc_type}", None)
+        if type_prompt and type_prompt.strip():
+            return type_prompt.format(ocr_text=ocr_text)
+
+    # Default config rename prompt
+    try:
+        return settings.rename_prompt.format(ocr_text=ocr_text)
+    except Exception:
+        pass
+
+    # Hardcoded fallback
+    return (
         "Analyze the following document text and suggest up to 5 tags "
         "that describe the document type, parties, subject, and year. "
         "Return ONLY a JSON array of strings, like: "
         '["invoice", "acme-corp", "2025"]. No explanation.\n\n'
-        f"Document text:\n{truncated}"
+        f"Document text:\n{ocr_text}"
     )
-
-    raw = await _call_ollama(prompt, settings)
-
-    return _parse_tag_array(raw)
 
 
 async def classify_document(

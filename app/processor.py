@@ -585,7 +585,7 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
         # Rename: only if enabled and OCR text exists
         if not job.skip_rename and ocr_full_text and settings.tagging_model:
             try:
-                proposed_name = await generate_filename(ocr_full_text, settings)
+                proposed_name = await generate_filename(ocr_full_text, settings, doc_type)
             except TaggingError as exc:
                 logger.warning(f"Job {job_id}: Rename failed: {exc}")
                 proposed_name = file_path.stem
@@ -593,7 +593,7 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
         # Tags: only if enabled and OCR text exists
         if not job.skip_tags and ocr_full_text and settings.tagging_model:
             try:
-                proposed_tags = await generate_tags(ocr_full_text, settings)
+                proposed_tags = await generate_tags(ocr_full_text, settings, doc_type)
             except TaggingError as exc:
                 logger.warning(f"Job {job_id}: Tagging failed: {exc}")
                 proposed_tags = []
