@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     split_confidence: float = 0.7
     split_model: str = "glm-ocr"
     split_min_pages: int = 3
+    split_blank_threshold: int = 245  # Pixel value (0-255); above this counts as "white"
+    split_blank_pixel_pct: float = 0.95  # Fraction of pixels that must be "white" to flag blank
 
     # ---- Allowed file extensions ----
     allowed_extensions: set[str] = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
@@ -176,6 +178,22 @@ class Settings(BaseSettings):
         v = v.strip().lower()
         if v not in ("heuristic", "hybrid", "off"):
             raise ValueError(f"Split engine must be heuristic, hybrid, or off, got '{v}'")
+        return v
+
+    @field_validator("split_blank_threshold")
+    @classmethod
+    def validate_split_blank_threshold(cls, v: int) -> int:
+        """Blank page whiteness threshold must be 0-255."""
+        if not 0 <= v <= 255:
+            raise ValueError(f"Blank whiteness threshold must be 0-255, got {v}")
+        return v
+
+    @field_validator("split_blank_pixel_pct")
+    @classmethod
+    def validate_split_blank_pixel_pct(cls, v: float) -> float:
+        """Blank page pixel percentage must be 0-1."""
+        if not 0 <= v <= 1:
+            raise ValueError(f"Blank pixel percentage must be 0-1, got {v}")
         return v
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
@@ -305,9 +323,12 @@ def get_editable_fields() -> list[str]:
         "verify_min_score",
         "extract_fields",
         "split_engine",
+        "split_model",
         "split_dpi",
         "split_confidence",
         "split_min_pages",
+        "split_blank_threshold",
+        "split_blank_pixel_pct",
         "max_file_size_mb",
         "watch_interval",
     ]

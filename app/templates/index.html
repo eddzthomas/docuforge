@@ -24,6 +24,7 @@
         <button class="tab-btn active" data-tab="upload">Upload</button>
         <button class="tab-btn" data-tab="history">History</button>
         <button class="tab-btn" data-tab="logs">Logs</button>
+        <button class="tab-btn" data-tab="split">Split PDF</button>
         <button class="tab-btn" data-tab="settings">Settings</button>
     </nav>
 
@@ -147,7 +148,75 @@
     </div>
 
     <!-- ============================================================
-         TAB 4: Settings
+         TAB 4: Split PDF
+         Automated PDF splitting using AI boundary detection
+         ============================================================ -->
+    <div class="tab-panel" id="panel-split">
+        <div style="max-width:700px;">
+            <h3 style="margin-bottom:4px;">Split PDF</h3>
+            <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px;">
+                Drop a multi-document PDF here or select one below to auto-detect where documents begin and end.
+            </p>
+
+            <!-- Mini upload zone for Split tab -->
+            <div class="upload-zone" id="split-upload-zone" style="padding:20px;margin-bottom:12px;">
+                <span class="upload-zone-icon" style="font-size:1.5rem;">&#128196;</span>
+                <p style="margin:4px 0;font-size:0.85rem;">Drop a PDF here or click to browse</p>
+                <input type="file" id="split-file-input" accept=".pdf" style="display:none;">
+            </div>
+
+            <!-- Job selector + detect button -->
+            <div class="form-group" style="display:flex;gap:8px;align-items:flex-end;">
+                <div style="flex:1;">
+                    <label for="split-tab-job-select">Or select an already-uploaded PDF</label>
+                    <select id="split-tab-job-select" style="width:100%;">
+                        <option value="">— Select an uploaded PDF —</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" id="split-tab-detect-btn" onclick="executeTabDetect()">
+                    Detect Splits
+                </button>
+            </div>
+
+            <!-- Progress bar (hidden until detection starts) -->
+            <div id="split-tab-progress" style="display:none;margin-top:16px;">
+                <div class="job-progress" style="max-width:100%;height:10px;">
+                    <div class="job-progress-bar split-bar" id="split-tab-progress-bar" style="width:0%"></div>
+                </div>
+                <span style="font-size:0.8rem;color:var(--primary);" id="split-tab-phase-label"></span>
+            </div>
+
+            <!-- Preview results (hidden until detection completes) -->
+            <div id="split-tab-preview" style="display:none;margin-top:16px;">
+                <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer;font-size:0.8rem;">
+                    <input type="checkbox" id="tab-split-select-all" checked onchange="toggleTabSplitSelectAll()">
+                    <strong id="tab-split-count-label">Select All</strong>
+                </label>
+                <table class="job-table" style="margin-bottom:12px;">
+                    <thead><tr>
+                        <th style="width:30px"></th>
+                        <th>#</th><th>Pages</th><th>Page Count</th><th>Confidence</th><th>Status</th>
+                    </tr></thead>
+                    <tbody id="split-tab-preview-tbody"></tbody>
+                </table>
+                <details style="margin-bottom:12px;">
+                    <summary style="cursor:pointer;font-size:0.8rem;color:var(--text-secondary)">Adjust Boundaries</summary>
+                    <p style="font-size:0.7rem;color:var(--text-muted)">Comma-separated 0-based page indices.</p>
+                    <div style="display:flex;gap:6px;">
+                        <input type="text" id="tab-split-adjust-input" class="modal-input" style="flex:1;">
+                        <button class="btn btn-sm" onclick="adjustTabSplits()">Update</button>
+                    </div>
+                </details>
+                <button class="btn btn-primary" id="tab-split-confirm-btn" onclick="confirmTabSplit()">
+                    Approve Selected & Split
+                </button>
+                <div id="split-tab-result" style="margin-top:12px;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================
+         TAB 5: Settings
          Configuration form — loads from API, saves to persistent JSON
          ============================================================ -->
     <div class="tab-panel" id="panel-settings">
@@ -206,6 +275,45 @@
                 <label for="cfg-rename-prompt">Rename Prompt Template</label>
                 <textarea id="cfg-rename-prompt" rows="6" placeholder="Prompt must include {ocr_text} placeholder"></textarea>
             </div>
+
+            <!-- Splitting Settings -->
+            <fieldset style="border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:12px;">
+                <legend style="font-weight:600;color:var(--text-secondary);padding:0 6px;">Splitting</legend>
+                <div class="form-group">
+                    <label for="cfg-split-engine">Split Engine</label>
+                    <select id="cfg-split-engine">
+                        <option value="heuristic">Heuristic (Tesseract only — fast, no LLM cost)</option>
+                        <option value="hybrid">Hybrid (Tesseract + Vision model — most accurate)</option>
+                        <option value="off">Off (no split detection)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-split-dpi">Split Detection DPI</label>
+                    <input type="number" id="cfg-split-dpi" value="150" min="72" max="600">
+                    <span style="font-size:0.7rem;color:var(--text-muted)">Lower = faster detection (72–600)</span>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-split-confidence">Auto-Accept Confidence (0–1)</label>
+                    <input type="number" id="cfg-split-confidence" value="0.7" min="0" max="1" step="0.05">
+                    <span style="font-size:0.7rem;color:var(--text-muted)">Boundaries above this confidence auto-approve</span>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-split-min-pages">Minimum Pages for Splitting</label>
+                    <input type="number" id="cfg-split-min-pages" value="3" min="2">
+                    <span style="font-size:0.7rem;color:var(--text-muted)">Only offer splitting for PDFs with ≥ this many pages</span>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-split-blank-threshold">Blank Page Whiteness (0–255)</label>
+                    <input type="number" id="cfg-split-blank-threshold" value="245" min="0" max="255">
+                    <span style="font-size:0.7rem;color:var(--text-muted)">Pixel value at or above this counts as "white"</span>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-split-blank-pixel-pct">Blank Page White % (0–1)</label>
+                    <input type="number" id="cfg-split-blank-pixel-pct" value="0.95" min="0" max="1" step="0.01">
+                    <span style="font-size:0.7rem;color:var(--text-muted)">Fraction of pixels that must be white to flag blank</span>
+                </div>
+            </fieldset>
+
             <button type="submit" class="btn btn-primary" id="save-settings-btn" onclick="saveConfig()">
                 Save Settings
             </button>
@@ -265,6 +373,9 @@ function switchTab(tabName) {
     }
     if (tabName === 'logs') {
         refreshLogs();
+    }
+    if (tabName === 'split') {
+        loadSplitTabJobs();
     }
 }
 
@@ -483,9 +594,31 @@ function renderJobHistory(data) {
 
         // Build page progress bar
         let progressHtml = '';
+
+        // Split detection progress (shown when split_phase is active)
+        if (job.split_phase && job.split_phase !== 'done' && job.split_phase !== '') {
+            const spct = job.split_progress_pct || 0;
+            const phaseLabels = {
+                rendering: 'Rendering pages...',
+                detecting: 'Starting detection...',
+                blank: 'Detecting blank pages...',
+                page_numbers: 'Analyzing page numbers...',
+                headers: 'Comparing headers...',
+                vision: 'Running vision model...',
+                merging: 'Merging results...',
+            };
+            const phaseLabel = phaseLabels[job.split_phase] || job.split_phase;
+            progressHtml = `
+                <div class="job-progress split-progress">
+                    <div class="job-progress-bar split-bar" style="width:${spct}%"></div>
+                    <span class="job-progress-text split-phase-text">${escapeHtml(phaseLabel)} ${spct}%</span>
+                </div>`;
+        }
+
+        // OCR page progress (shown during processing)
         if (job.pages > 0 && (job.status === 'processing' || job.status === 'queued')) {
             const pct = Math.round((job.pages_done / job.pages) * 100);
-            progressHtml = `
+            progressHtml += `
                 <div class="job-progress">
                     <div class="job-progress-bar" style="width:${pct}%"></div>
                     <span class="job-progress-text">${job.pages_done}/${job.pages} pages</span>
@@ -531,6 +664,10 @@ function renderJobHistory(data) {
 
         // Build actions column
         let actionsHtml = '';
+        // Standalone split button for any PDF job with a file path
+        if (job.file_path && job.file_path.toLowerCase().endsWith('.pdf') && job.status !== 'awaiting_split_approval') {
+            actionsHtml += `<button class="btn btn-sm" onclick="openStandaloneSplit('${job.id}')" title="Manually split this PDF at specified pages" style="margin-right:4px;">Split</button>`;
+        }
         if (job.status === 'done' && job.output_filename) {
             actionsHtml = `<button class="btn btn-sm" onclick="openPdfViewer('${job.id}', '${escapeHtml(job.output_filename)}')">View</button>
                 <a href="/api/download/${job.id}" class="btn btn-sm btn-primary" download>Download</a>`;
@@ -837,6 +974,431 @@ function closeModal() {
 }
 
 // ---- Split Preview Modal ----
+async function openStandaloneSplit(jobId) {
+    // Simple standalone split — user specifies boundaries directly
+    modalContent.dataset.jobId = jobId;
+    modalContent.innerHTML = `
+        <h3>Manual PDF Split</h3>
+        <p style="color:var(--text-muted);font-size:0.8rem;margin-bottom:12px">
+            Split this PDF at specific page boundaries without running detection.
+            The original file is preserved; each segment becomes a new child PDF.
+        </p>
+        <div class="form-group">
+            <label style="font-size:0.8rem;color:var(--text-secondary)">Split Boundaries</label>
+            <p style="font-size:0.7rem;color:var(--text-muted)">
+                Comma-separated 0-based page indices.
+                Example: <code>3,7,12</code> creates docs for pages 0–2, 3–6, 7–11, 12–end
+            </p>
+            <input type="text" id="standalone-split-input" class="modal-input"
+                   placeholder="e.g. 3,7,12"
+                   style="width:100%;margin-bottom:8px;">
+        </div>
+        <div class="form-group">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="standalone-strip-blanks" checked>
+                <span style="font-size:0.8rem;">Auto-detect and remove blank pages</span>
+            </label>
+        </div>
+        <div class="form-group">
+            <label style="font-size:0.8rem;color:var(--text-secondary)">Base Name (optional)</label>
+            <input type="text" id="standalone-base-name" class="modal-input"
+                   placeholder="Leave empty for auto-generated names"
+                   style="width:100%;">
+        </div>
+        <div class="modal-actions">
+            <button class="btn" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="executeStandaloneSplit()">Split PDF</button>
+        </div>
+    `;
+    modalOverlay.classList.add('open');
+}
+
+async function executeStandaloneSplit() {
+    const jobId = modalContent.dataset.jobId;
+    const input = document.getElementById('standalone-split-input');
+    if (!input) return;
+    const boundaries = input.value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
+    if (boundaries.length === 0) {
+        showToast('Enter at least one valid page index > 0', 'error');
+        return;
+    }
+    const stripBlanks = document.getElementById('standalone-strip-blanks')?.checked ?? true;
+    const baseName = document.getElementById('standalone-base-name')?.value?.trim() || '';
+
+    try {
+        const res = await fetch('/api/pdf/split', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                job_id: jobId,
+                boundaries: boundaries,
+                strip_blanks: stripBlanks,
+                base_name: baseName,
+            }),
+        });
+        if (res.ok) {
+            const data = await res.json();
+            showToast(`Split into ${data.count} documents`, 'success');
+            closeModal();
+            refreshJobs();
+        } else {
+            const err = await res.json();
+            showToast(err.detail || 'Failed to split PDF', 'error');
+        }
+    } catch (err) { showToast('Network error', 'error'); }
+}
+
+// ---- Split Tab Upload Zone ----
+function initSplitTabUpload() {
+    const zone = document.getElementById('split-upload-zone');
+    const input = document.getElementById('split-file-input');
+    if (!zone || !input) return;
+
+    zone.addEventListener('click', () => input.click());
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+        zone.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
+    });
+    ['dragenter', 'dragover'].forEach(evt => {
+        zone.addEventListener(evt, () => zone.classList.add('drag-over'));
+    });
+    ['dragleave', 'drop'].forEach(evt => {
+        zone.addEventListener(evt, () => zone.classList.remove('drag-over'));
+    });
+
+    zone.addEventListener('drop', e => {
+        const files = Array.from(e.dataTransfer.files).filter(f =>
+            f.name.toLowerCase().endsWith('.pdf')
+        );
+        if (files.length === 0) {
+            showToast('Only PDF files are supported here', 'error');
+            return;
+        }
+        handleSplitTabFile(files[0]);
+    });
+
+    input.addEventListener('change', () => {
+        if (input.files.length > 0) handleSplitTabFile(input.files[0]);
+        input.value = '';
+    });
+}
+
+async function handleSplitTabFile(file) {
+    const zone = document.getElementById('split-upload-zone');
+    if (zone) zone.innerHTML = '<p style="color:var(--text-secondary);">Uploading ' + escapeHtml(file.name) + '...</p>';
+
+    const formData = new FormData();
+    formData.append('files', file);
+    formData.append('skip_rename', 'true');
+    formData.append('skip_tags', 'true');
+
+    try {
+        const res = await fetch('/api/upload', { method: 'POST', body: formData });
+        if (!res.ok) {
+            const err = await res.json();
+            showToast('Upload failed: ' + (err.detail || res.statusText), 'error');
+            if (zone) zone.innerHTML = '<p style="color:var(--danger);">Upload failed — try again</p>';
+            return;
+        }
+        const data = await res.json();
+        const jobId = data.jobs?.[0]?.id;
+        if (!jobId) { showToast('Upload succeeded but no job created', 'error'); return; }
+
+        // Refresh the dropdown and auto-select
+        await loadSplitTabJobs();
+        const select = document.getElementById('split-tab-job-select');
+        if (select) select.value = jobId;
+
+        // Restore the upload zone
+        if (zone) {
+            zone.innerHTML = `
+                <span class="upload-zone-icon" style="font-size:1.5rem;">&#128196;</span>
+                <p style="margin:4px 0;font-size:0.85rem;">Drop a PDF here or click to browse</p>
+                <input type="file" id="split-file-input" accept=".pdf" style="display:none;">`;
+            initSplitTabUpload();
+        }
+
+        showToast('Uploaded — starting split detection...', 'info');
+        setTimeout(() => executeTabDetect(), 500);
+    } catch (err) {
+        showToast('Network error during upload', 'error');
+        if (zone) zone.innerHTML = '<p style="color:var(--danger);">Upload failed — network error</p>';
+    }
+}
+
+// ---- Split Tab Functions ----
+async function loadSplitTabJobs() {
+    const select = document.getElementById('split-tab-job-select');
+    if (!select) return;
+    select.innerHTML = '<option value="">— Loading PDFs —</option>';
+    try {
+        const res = await fetch('/api/jobs?per_page=100');
+        const data = await res.json();
+        const pdfJobs = (data.jobs || []).filter(j =>
+            j.file_path && j.file_path.toLowerCase().endsWith('.pdf')
+        );
+        select.innerHTML = '<option value="">— Select a PDF —</option>';
+        if (pdfJobs.length === 0) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.disabled = true;
+            opt.textContent = 'No PDFs uploaded yet';
+            select.appendChild(opt);
+        } else {
+            pdfJobs.forEach(j => {
+                const opt = document.createElement('option');
+                opt.value = j.id;
+                const pages = j.pages ? ` (${j.pages} pages)` : '';
+                opt.textContent = `${j.original_name}${pages}`;
+                select.appendChild(opt);
+            });
+        }
+    } catch (err) {
+        select.innerHTML = '<option value="">— Failed to load —</option>';
+    }
+}
+
+async function executeTabDetect() {
+    const jobId = document.getElementById('split-tab-job-select')?.value;
+    if (!jobId) { showToast('Select a PDF first', 'error'); return; }
+
+    const btn = document.getElementById('split-tab-detect-btn');
+    const progressDiv = document.getElementById('split-tab-progress');
+    const previewDiv = document.getElementById('split-tab-preview');
+    const resultEl = document.getElementById('split-tab-result');
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Detecting...'; }
+    if (progressDiv) { progressDiv.style.display = ''; }
+    if (previewDiv) previewDiv.style.display = 'none';
+    if (resultEl) resultEl.innerHTML = '';
+
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-detect`, { method: 'POST' });
+        if (!res.ok) {
+            const err = await res.json();
+            showToast(err.detail || 'Detection failed', 'error');
+            if (progressDiv) progressDiv.style.display = 'none';
+            if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
+            return;
+        }
+    } catch (err) {
+        showToast('Network error', 'error');
+        if (progressDiv) progressDiv.style.display = 'none';
+        if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
+        return;
+    }
+
+    // Poll for progress and then render preview
+    await pollSplitProgress(jobId);
+    if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
+}
+
+async function pollSplitProgress(jobId) {
+    const progressBar = document.getElementById('split-tab-progress-bar');
+    const phaseLabel = document.getElementById('split-tab-phase-label');
+    const phaseLabels = {
+        rendering: 'Rendering pages...',
+        detecting: 'Starting detection...',
+        blank: 'Detecting blank pages...',
+        page_numbers: 'Analyzing page numbers...',
+        headers: 'Comparing headers...',
+        vision: 'Running vision model...',
+        merging: 'Merging results...',
+    };
+
+    for (let i = 0; i < 300; i++) { // max 5 minutes at 1s intervals
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+            const res = await fetch(`/api/jobs/${jobId}`);
+            const job = await res.json();
+            const pct = job.split_progress_pct || 0;
+            const phase = job.split_phase || '';
+
+            if (progressBar) progressBar.style.width = pct + '%';
+            if (phaseLabel) {
+                phaseLabel.textContent = (phaseLabels[phase] || phase) + ' ' + pct + '%';
+            }
+
+            if (phase === 'done' || pct >= 100) {
+                if (progressBar) progressBar.style.width = '100%';
+                if (phaseLabel) phaseLabel.textContent = 'Detection complete';
+                // Hide progress after brief pause, then render preview
+                await new Promise(r => setTimeout(r, 500));
+                document.getElementById('split-tab-progress').style.display = 'none';
+                await renderTabSplitPreview(jobId);
+                return;
+            }
+
+            // If job failed
+            if (job.status === 'failed') {
+                if (phaseLabel) phaseLabel.textContent = 'Detection failed';
+                showToast('Split detection failed', 'error');
+                return;
+            }
+        } catch (e) {
+            // Network error during poll — retry
+        }
+    }
+    if (phaseLabel) phaseLabel.textContent = 'Detection timed out';
+}
+
+async function renderTabSplitPreview(jobId) {
+    let preview;
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-preview`);
+        if (!res.ok) { showToast('Failed to load preview', 'error'); return; }
+        preview = await res.json();
+    } catch (err) { showToast('Network error', 'error'); return; }
+
+    if (!preview.children || preview.children.length === 0) {
+        showToast('No document boundaries detected', 'info');
+        return;
+    }
+
+    // Store boundaries for later use
+    const previewDiv = document.getElementById('split-tab-preview');
+    if (previewDiv) {
+        previewDiv.style.display = '';
+        previewDiv.dataset.jobId = jobId;
+        previewDiv.dataset.boundaries = JSON.stringify(preview.boundaries || []);
+    }
+
+    const tbody = document.getElementById('split-tab-preview-tbody');
+    if (tbody) {
+        tbody.innerHTML = preview.children.map(c => `
+            <tr data-child-index="${c.index}">
+                <td><input type="checkbox" class="tab-split-child-chk" checked onchange="updateTabSplitSelectAll()"></td>
+                <td>Doc ${c.index}</td>
+                <td>${c.start_page}–${c.end_page}</td>
+                <td>${c.page_count}</td>
+                <td>${Math.round(c.confidence * 100)}%</td>
+                <td>${c.auto_approved
+                    ? '<span style="color:var(--success)">high confidence</span>'
+                    : '<span style="color:var(--warning)">review needed</span>'}</td>
+            </tr>
+        `).join('');
+    }
+
+    // Set adjust input
+    const adjustInput = document.getElementById('tab-split-adjust-input');
+    if (adjustInput) adjustInput.value = (preview.boundaries || []).join(',');
+
+    // Update select-all count
+    const countLabel = document.getElementById('tab-split-count-label');
+    if (countLabel) countLabel.textContent = `Select All (${preview.children.length})`;
+
+    // Reset select-all checkbox
+    const masterChk = document.getElementById('tab-split-select-all');
+    if (masterChk) masterChk.checked = true;
+}
+
+function toggleTabSplitSelectAll() {
+    const master = document.getElementById('tab-split-select-all');
+    if (!master) return;
+    document.querySelectorAll('.tab-split-child-chk').forEach(chk => {
+        chk.checked = master.checked;
+    });
+    updateTabSplitSelectAll();
+}
+
+function updateTabSplitSelectAll() {
+    const master = document.getElementById('tab-split-select-all');
+    if (!master) return;
+    const allChks = document.querySelectorAll('.tab-split-child-chk');
+    const checked = Array.from(allChks).filter(c => c.checked).length;
+    master.checked = checked > 0 && checked === allChks.length;
+    const label = document.getElementById('tab-split-count-label');
+    if (label) label.textContent = `Select All (${checked})`;
+}
+
+function getCheckedTabBoundaries() {
+    const previewDiv = document.getElementById('split-tab-preview');
+    const boundaries = JSON.parse(previewDiv?.dataset.boundaries || '[]');
+    const children = [];
+    let start = 0;
+    for (let i = 0; i <= boundaries.length; i++) {
+        const end = i < boundaries.length ? boundaries[i] : Infinity;
+        children.push({ index: i + 1, start, end });
+        start = end;
+    }
+    const rows = document.querySelectorAll('#split-tab-preview-tbody tr');
+    const checkedChildren = [];
+    rows.forEach((row, idx) => {
+        const chk = row.querySelector('.tab-split-child-chk');
+        if (chk && chk.checked && idx < children.length) checkedChildren.push(children[idx]);
+    });
+    const newBoundaries = [];
+    for (let i = 0; i < checkedChildren.length - 1; i++) {
+        newBoundaries.push(checkedChildren[i].end);
+    }
+    return newBoundaries;
+}
+
+async function adjustTabSplits() {
+    const jobId = document.getElementById('split-tab-preview')?.dataset.jobId;
+    if (!jobId) return;
+    const input = document.getElementById('tab-split-adjust-input');
+    if (!input) return;
+    const boundaries = input.value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-points`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({boundaries}),
+        });
+        if (res.ok) {
+            showToast('Boundaries updated', 'info');
+            await renderTabSplitPreview(jobId);
+        } else {
+            showToast('Failed to update boundaries', 'error');
+        }
+    } catch (err) { showToast('Network error', 'error'); }
+}
+
+async function confirmTabSplit() {
+    const previewDiv = document.getElementById('split-tab-preview');
+    const jobId = previewDiv?.dataset.jobId;
+    if (!jobId) return;
+
+    const newBoundaries = getCheckedTabBoundaries();
+    const btn = document.getElementById('tab-split-confirm-btn');
+    const resultEl = document.getElementById('split-tab-result');
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Splitting...'; }
+
+    // Save filtered boundaries
+    try {
+        await fetch(`/api/jobs/${jobId}/split-points`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({boundaries: newBoundaries}),
+        });
+    } catch (e) {}
+
+    // Confirm split
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-confirm`, { method: 'POST' });
+        if (res.ok) {
+            const data = await res.json();
+            if (resultEl) {
+                resultEl.innerHTML = `
+                    <div style="color:var(--success);margin-bottom:8px;margin-top:12px;">
+                        Split complete — ${data.child_count} documents created
+                    </div>`;
+            }
+            showToast(`Split into ${data.child_count} documents`, 'success');
+            if (previewDiv) {
+                previewDiv.style.display = 'none';
+                document.getElementById('split-tab-progress').style.display = 'none';
+            }
+        } else {
+            const err = await res.json();
+            if (resultEl) resultEl.innerHTML = `<span style="color:var(--danger)">${escapeHtml(err.detail || 'Failed')}</span>`;
+            showToast(err.detail || 'Split failed', 'error');
+        }
+    } catch (err) { showToast('Network error', 'error'); }
+    finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Approve Selected & Split'; }
+    }
+}
+
 async function openSplitPreview(jobId) {
     let preview;
     try {
@@ -845,18 +1407,27 @@ async function openSplitPreview(jobId) {
         preview = await res.json();
     } catch (err) { showToast('Network error', 'error'); return; }
 
+    modalContent.dataset.jobId = jobId;
+    modalContent.dataset.boundaries = JSON.stringify(preview.boundaries || []);
+
     modalContent.innerHTML = `
         <h3>Split Preview — ${preview.total_pages} pages</h3>
         <p style="color:var(--text-muted);font-size:0.8rem;margin-bottom:12px">
-            Detected ${preview.children.length} sub-documents. Review and adjust before confirming.
+            Detected ${preview.children.length} sub-documents. Uncheck to merge with the previous document.
         </p>
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer;font-size:0.8rem;">
+            <input type="checkbox" id="split-select-all" checked onchange="toggleSplitSelectAll()">
+            <strong>Select All (${preview.children.length})</strong>
+        </label>
         <table class="job-table" style="margin-bottom:12px;">
             <thead><tr>
+                <th style="width:30px"></th>
                 <th>#</th><th>Pages</th><th>Page Count</th><th>Confidence</th><th>Status</th>
             </tr></thead>
-            <tbody>
+            <tbody id="split-preview-tbody">
                 ${preview.children.map(c => `
-                    <tr>
+                    <tr data-child-index="${c.index}">
+                        <td><input type="checkbox" class="split-child-chk" checked onchange="updateSplitSelectAll()"></td>
                         <td>Doc ${c.index}</td>
                         <td>${c.start_page}–${c.end_page}</td>
                         <td>${c.page_count}</td>
@@ -874,14 +1445,96 @@ async function openSplitPreview(jobId) {
             <input type="text" id="split-adjust-input" class="modal-input"
                    value="${(preview.boundaries || []).join(',')}"
                    style="width:100%;margin-top:4px;">
-            <button class="btn btn-sm" onclick="adjustSplits('${jobId}')" style="margin-top:6px;">Update</button>
+            <button class="btn btn-sm" onclick="adjustSplits('${jobId}')" style="margin-top:6px;">Update Boundaries</button>
         </details>
         <div class="modal-actions">
             <button class="btn" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" onclick="confirmSplit('${jobId}')">Confirm & Split</button>
+            <button class="btn btn-primary" onclick="confirmSelectedSplits('${jobId}')">Approve Selected & Process</button>
         </div>
     `;
     modalOverlay.classList.add('open');
+}
+
+function toggleSplitSelectAll() {
+    const master = document.getElementById('split-select-all');
+    if (!master) return;
+    document.querySelectorAll('.split-child-chk').forEach(chk => {
+        chk.checked = master.checked;
+    });
+}
+
+function updateSplitSelectAll() {
+    const master = document.getElementById('split-select-all');
+    if (!master) return;
+    const allChks = document.querySelectorAll('.split-child-chk');
+    master.checked = allChks.length > 0 && Array.from(allChks).every(c => c.checked);
+    // Update count
+    const checked = Array.from(allChks).filter(c => c.checked).length;
+    const label = master.parentElement?.querySelector('strong');
+    if (label) label.textContent = `Select All (${checked})`;
+}
+
+function getCheckedSplitBoundaries() {
+    // Return boundaries for checked children only
+    const boundaries = JSON.parse(modalContent.dataset.boundaries || '[]');
+    // Get children from preview table to map checked state
+    const children = [];
+    let start = 0;
+    for (let i = 0; i <= boundaries.length; i++) {
+        const end = i < boundaries.length ? boundaries[i] : Infinity;
+        children.push({ index: i + 1, start, end });
+        start = end;
+    }
+    // Filter to checked children only
+    const checkedChildren = [];
+    const rows = document.querySelectorAll('#split-preview-tbody tr');
+    rows.forEach((row, idx) => {
+        const chk = row.querySelector('.split-child-chk');
+        if (chk && chk.checked && idx < children.length) {
+            checkedChildren.push(children[idx]);
+        }
+    });
+    // Build new boundaries from checked children
+    const newBoundaries = [];
+    for (let i = 0; i < checkedChildren.length - 1; i++) {
+        newBoundaries.push(checkedChildren[i].end);
+    }
+    return newBoundaries;
+}
+
+async function confirmSelectedSplits(jobId) {
+    const newBoundaries = getCheckedSplitBoundaries();
+    if (newBoundaries.length === 0) {
+        // All merged into one doc — just remove boundaries
+        try {
+            await fetch(`/api/jobs/${jobId}/split-points`, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({boundaries: []}),
+            });
+        } catch (e) {}
+    } else {
+        // Save the filtered boundaries
+        try {
+            await fetch(`/api/jobs/${jobId}/split-points`, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({boundaries: newBoundaries}),
+            });
+        } catch (e) {}
+    }
+
+    // Now confirm the split
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/split-confirm`, {method: 'POST'});
+        if (res.ok) {
+            const data = await res.json();
+            showToast(`Split into ${data.child_count} documents`, 'success');
+            closeModal();
+            refreshJobs();
+        } else {
+            const err = await res.json();
+            showToast(err.detail || 'Failed to confirm split', 'error');
+        }
+    } catch (err) { showToast('Network error', 'error'); }
 }
 
 async function adjustSplits(jobId) {
@@ -1170,6 +1823,12 @@ async function loadConfig() {
         setFieldValue('cfg-watch-interval', cfg.watch_interval);
         setFieldValue('cfg-auto-rename', cfg.auto_rename ? 'true' : 'false');
         setFieldValue('cfg-rename-prompt', cfg.rename_prompt);
+        setFieldValue('cfg-split-engine', cfg.split_engine);
+        setFieldValue('cfg-split-dpi', cfg.split_dpi);
+        setFieldValue('cfg-split-confidence', cfg.split_confidence);
+        setFieldValue('cfg-split-min-pages', cfg.split_min_pages);
+        setFieldValue('cfg-split-blank-threshold', cfg.split_blank_threshold);
+        setFieldValue('cfg-split-blank-pixel-pct', cfg.split_blank_pixel_pct);
     } catch (err) {
         console.error('Failed to load config:', err);
     }
@@ -1212,6 +1871,12 @@ async function saveConfig() {
         watch_interval: parseInt(document.getElementById('cfg-watch-interval').value) || 5,
         auto_rename: document.getElementById('cfg-auto-rename').value === 'true',
         rename_prompt: document.getElementById('cfg-rename-prompt').value,
+        split_engine: document.getElementById('cfg-split-engine').value,
+        split_dpi: parseInt(document.getElementById('cfg-split-dpi').value) || 150,
+        split_confidence: parseFloat(document.getElementById('cfg-split-confidence').value) || 0.7,
+        split_min_pages: parseInt(document.getElementById('cfg-split-min-pages').value) || 3,
+        split_blank_threshold: parseInt(document.getElementById('cfg-split-blank-threshold').value) || 245,
+        split_blank_pixel_pct: parseFloat(document.getElementById('cfg-split-blank-pixel-pct').value) || 0.95,
     };
 
     try {
@@ -1275,8 +1940,16 @@ async function testOllamaConnection() {
             const modelList = data.models.length > 0
                 ? data.models.slice(0, 5).map(m => `<code style="font-size:0.7rem">${escapeHtml(m)}</code>`).join(', ')
                 : 'no models pulled';
+            let gpuLine = '';
+            if (data.gpu_available) {
+                gpuLine = ` | <span style="color:var(--success);font-size:0.7rem">GPU: available</span>`;
+            } else if (data.gpu_info) {
+                gpuLine = ` | <span style="color:var(--warning);font-size:0.7rem">GPU: not detected (${escapeHtml(data.gpu_info)})</span>`;
+            } else {
+                gpuLine = ` | <span style="color:var(--text-muted);font-size:0.7rem">GPU: unknown (no models loaded yet)</span>`;
+            }
             if (resultEl) {
-                resultEl.innerHTML = `<span style="color:var(--success)">Connected</span> — ${modelList}`;
+                resultEl.innerHTML = `<span style="color:var(--success)">Connected</span> — ${modelList}${gpuLine}`;
             }
         } else {
             if (resultEl) {
@@ -1405,7 +2078,11 @@ async function checkHealth() {
 
         if (data.ollama === 'connected') {
             dot.className = 'status-dot online';
-            text.textContent = 'Ollama connected';
+            let msg = 'Ollama connected';
+            if (data.gpu_available) {
+                msg += ' | GPU: active';
+            }
+            text.textContent = msg;
         } else {
             dot.className = 'status-dot offline';
             text.textContent = 'Ollama disconnected — OCR unavailable';
@@ -1424,6 +2101,9 @@ setInterval(checkHealth, 10000);
 // Watcher status poll — every 5 seconds
 checkWatcherStatus();
 setInterval(checkWatcherStatus, 5000);
+
+// Initialize Split tab upload zone
+initSplitTabUpload();
 </script>
 </body>
 </html>

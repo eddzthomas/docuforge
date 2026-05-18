@@ -109,6 +109,8 @@ class JobData:
         self.split_boundaries: list[int] = []
         self.split_confidences: list[float] = []
         self.blank_pages_removed: list[int] = []
+        self.split_progress_pct: int = 0      # 0–100
+        self.split_phase: str = ""            # "rendering", "heuristics", "vision", "merging", "done"
 
     def to_dict(self) -> dict:
         """
@@ -141,6 +143,8 @@ class JobData:
             "split_boundaries": self.split_boundaries,
             "split_confidences": self.split_confidences,
             "blank_pages_removed": self.blank_pages_removed,
+            "split_progress_pct": self.split_progress_pct,
+            "split_phase": self.split_phase,
         }
 
 
@@ -405,9 +409,25 @@ async def process_file(job_id: str, file_path: Path, settings: Settings | None =
                 if pdf_page_count >= settings.split_min_pages:
                     log_event("info", f"Running split detection ({settings.split_engine}): {pdf_path.name}", job_id)
                     # Render pages at split DPI (lower than processing DPI for speed)
+                    job_manager.update_job(job_id, split_phase="rendering", split_progress_pct=0)
                     split_images = pdf_to_images(pdf_path, settings.split_dpi)
+                    job_manager.update_job(job_id, split_phase="detecting", split_progress_pct=5)
+
                     detector = SplitDetector(settings)
-                    split_result = await detector.detect(pdf_path, split_images, settings)
+
+                    # Progress callback that updates the job in real time
+                    def on_progress(phase, pct):
+                        job_manager.update_job(
+                            job_id,
+                            split_phase=phase,
+                            split_progress_pct=min(pct, 99),
+                        )
+
+                    split_result = await detector.detect(
+                        pdf_path, split_images, settings,
+                        progress_callback=on_progress,
+                    )
+                    job_manager.update_job(job_id, split_phase="done", split_progress_pct=100)
 
                     if split_result and split_result.get("boundaries"):
                         boundaries = split_result["boundaries"]

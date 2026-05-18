@@ -43,6 +43,10 @@ services:
     volumes:
       # Persist downloaded models across restarts
       - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=4
+      - OLLAMA_MAX_LOADED_MODELS=2
+      - OLLAMA_KEEP_ALIVE=10m
     restart: unless-stopped
     networks:
       - docuforge-net

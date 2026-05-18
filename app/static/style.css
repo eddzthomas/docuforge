@@ -509,6 +509,19 @@ header p {
     margin-top: 2px;
 }
 
+.split-progress {
+    max-width: 200px;
+}
+
+.split-bar {
+    background: var(--primary, #3b82f6);
+}
+
+.split-phase-text {
+    color: var(--primary, #3b82f6);
+    font-weight: 500;
+}
+
 .verify-score {
     display: inline-block;
     font-size: 0.75rem;

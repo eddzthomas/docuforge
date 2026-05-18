@@ -36,9 +36,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY scripts/ ./scripts/
 
-# Copy and set up entrypoint
+# Copy and set up entrypoint (strip Windows CRLF for Linux)
 COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
 
 # Create data directories and set ownership
 RUN mkdir -p /data/uploads /data/output && \

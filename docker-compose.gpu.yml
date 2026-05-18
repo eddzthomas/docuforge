@@ -9,6 +9,10 @@ version: "3.9"
 
 services:
   ollama:
+    environment:
+      - OLLAMA_NUM_PARALLEL=4
+      - OLLAMA_MAX_LOADED_MODELS=2
+      - OLLAMA_KEEP_ALIVE=10m
     deploy:
       resources:
         reservations:

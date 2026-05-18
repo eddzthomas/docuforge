@@ -41,7 +41,7 @@ from app.processor import (
     get_recent_events,
 )
 from app.tagger import generate_filename, generate_tags, sanitize_filename, TaggingError
-from app.pdf_utils import embed_tags_in_pdf
+from app.pdf_utils import embed_tags_in_pdf, split_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,16 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     Path(settings.upload_folder).mkdir(parents=True, exist_ok=True)
     Path(settings.output_folder).mkdir(parents=True, exist_ok=True)
+
+    # Warn if GLM-OCR is configured without GPU compose file
+    if settings.ocr_engine in ("glm-ocr", "glm-ocr-vllm"):
+        logger.warning(
+            "GLM-OCR selected as OCR engine. Ensure you started with "
+            "'docker compose -f docker-compose.yml -f docker-compose.gpu.yml up'. "
+            "Without GPU passthrough, GLM-OCR will fall back to CPU and be extremely slow. "
+            "Switch to ocr_engine=tesseract if no GPU is available."
+        )
+        log_event("warn", "GLM-OCR engine configured — verify GPU passthrough is active")
 
     # Start the queue worker as a background task
     worker_task = asyncio.create_task(job_queue.worker())
@@ -119,18 +129,32 @@ async def health_check():
     """
     Health check endpoint for Docker HEALTHCHECK and load balancers.
 
-    Returns the app status and Ollama connectivity state.
-    This endpoint is called every 30s by Docker's HEALTHCHECK.
+    Returns the app status, Ollama connectivity state, and GPU
+    availability info for the Ollama runtime.
     """
-    # Attempt to reach Ollama to report its status
     ollama_status = "disconnected"
+    gpu_available = False
+    gpu_info = None
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{settings.ollama_host}/api/tags")
             if response.status_code == 200:
                 ollama_status = "connected"
+
+            # Check if Ollama has GPU-accelerated models loaded
+            try:
+                ps_resp = await client.get(f"{settings.ollama_host}/api/ps")
+                if ps_resp.status_code == 200:
+                    ps_data = ps_resp.json()
+                    for model_info in ps_data.get("models", []):
+                        details = model_info.get("details", {})
+                        if "gpu" in str(details).lower() or details.get("gpu"):
+                            gpu_available = True
+                            gpu_info = str(details.get("gpu", ""))
+                            break
+            except Exception:
+                pass  # /api/ps may not be available on older Ollama versions
     except Exception:
-        # Any failure means Ollama is unreachable — not fatal for the app
         ollama_status = "disconnected"
 
     return {
@@ -138,6 +162,8 @@ async def health_check():
         "service": "docuforge",
         "version": "1.0.0",
         "ollama": ollama_status,
+        "gpu_available": gpu_available,
+        "gpu_info": gpu_info,
     }
 
 
@@ -675,13 +701,16 @@ async def test_ollama_connection():
     Test connectivity to the configured Ollama instance.
 
     Pings GET {ollama_host}/api/tags and returns reachable status
-    plus a list of available models.
+    plus a list of available models. Also checks GPU availability
+    via /api/ps for loaded model hardware info.
     """
     settings = get_settings()
     result = {
         "reachable": False,
         "host": settings.ollama_host,
         "models": [],
+        "gpu_available": False,
+        "gpu_info": None,
         "error": None,
     }
 
@@ -695,6 +724,24 @@ async def test_ollama_connection():
                 result["models"] = [
                     m.get("name", "unknown") for m in models
                 ]
+
+                # Check GPU availability via running model info
+                try:
+                    ps_resp = await client.get(f"{settings.ollama_host}/api/ps")
+                    if ps_resp.status_code == 200:
+                        ps_data = ps_resp.json()
+                        for model_info in ps_data.get("models", []):
+                            details = model_info.get("details", {})
+                            if details:
+                                result["gpu_info"] = (
+                                    f"{model_info.get('name', 'unknown')}: "
+                                    f"{str(details)[:200]}"
+                                )
+                                if "gpu" in str(details).lower():
+                                    result["gpu_available"] = True
+                                break
+                except Exception:
+                    pass
             else:
                 result["error"] = f"HTTP {response.status_code}: {response.text[:200]}"
     except httpx.ConnectError:
@@ -751,9 +798,24 @@ async def run_split_detection(job_id: str):
         raise HTTPException(status_code=400, detail="Split detection only available for PDF files")
 
     # Render at split DPI
+    job_manager.update_job(job_id, split_phase="rendering", split_progress_pct=0)
     split_images = pdf_to_images(file_path, settings.split_dpi)
+    job_manager.update_job(job_id, split_phase="detecting", split_progress_pct=5)
+
     detector = SplitDetector(settings)
-    split_result = await detector.detect(file_path, split_images, settings)
+
+    def on_progress(phase, pct):
+        job_manager.update_job(
+            job_id,
+            split_phase=phase,
+            split_progress_pct=min(pct, 99),
+        )
+
+    split_result = await detector.detect(
+        file_path, split_images, settings,
+        progress_callback=on_progress,
+    )
+    job_manager.update_job(job_id, split_phase="done", split_progress_pct=100)
 
     # Save thumbnails for preview
     from app.processor import _save_split_thumbnails
@@ -853,8 +915,6 @@ async def confirm_splits(job_id: str):
     if not job.split_boundaries:
         raise HTTPException(status_code=400, detail="No split boundaries defined")
 
-    from app.pdf_utils import split_pdf
-
     file_path = Path(job.file_path)
     child_paths = split_pdf(
         file_path,
@@ -939,4 +999,87 @@ async def batch_approve(body: dict):
     return JSONResponse({
         "approved": approved_count,
         "errors": errors,
+    })
+
+
+# =============================================================================
+# Standalone PDF Split (no detection — direct boundary split)
+# =============================================================================
+
+
+class SplitRequest(BaseModel):
+    """Request body for direct PDF splitting at specified boundaries."""
+    job_id: str = Field(..., description="ID of the uploaded job to split")
+    boundaries: list[int] = Field(..., description="0-based page indices to split at")
+    strip_blanks: bool = Field(default=True, description="Auto-detect and remove blank pages from children")
+    base_name: str = Field(default="", description="Override output filename prefix (uses file stem if empty)")
+
+
+@app.post("/api/pdf/split")
+async def split_pdf_direct(body: SplitRequest):
+    """
+    Split a PDF at exact page boundaries without running split detection.
+
+    Useful for manual splitting when you already know where documents
+    begin and end. The original file is preserved; each child is saved
+    as a separate PDF.
+
+    Body:
+        job_id: Reference to an uploaded PDF job.
+        boundaries: List of 0-based page indices to split at.
+            Example: [3, 7] splits into pages [0-2], [3-6], [7-end].
+        strip_blanks: If true, auto-detect and remove blank pages
+            from each child document.
+        base_name: Optional filename prefix for child PDFs.
+    """
+    settings = get_settings()
+    job = job_manager.get_job(body.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {body.job_id}")
+    if not job.file_path:
+        raise HTTPException(status_code=400, detail="Job has no file path")
+
+    file_path = Path(job.file_path)
+    if file_path.suffix.lower() != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=f"PDF splitting only supports .pdf files, got {file_path.suffix}",
+        )
+
+    if not body.boundaries:
+        raise HTTPException(status_code=400, detail="boundaries must be a non-empty list")
+
+    # Get actual page count (job.pages may be 0 on a fresh upload that
+    # hasn't been through the pipeline yet)
+    total_pages = job.pages
+    if not total_pages or total_pages == 0:
+        import pikepdf
+        with pikepdf.open(file_path) as pdf:
+            total_pages = len(pdf.pages)
+        job_manager.update_job(body.job_id, pages=total_pages)
+
+    validated = sorted(set(b for b in body.boundaries if 0 < b < total_pages))
+    if not validated:
+        raise HTTPException(status_code=400, detail=f"No valid boundaries in range 1–{total_pages - 1}")
+
+    base = body.base_name.strip() if body.base_name.strip() else file_path.stem
+
+    # Detect blank pages if requested
+    blank_list = None
+    if body.strip_blanks:
+        from app.processor import pdf_to_images
+        from app.splitter import SplitDetector
+        split_images = pdf_to_images(file_path, settings.split_dpi)
+        detector = SplitDetector(settings)
+        blank_list = detector._detect_blank_pages(split_images)
+        logger.info(f"Auto-detected {len(blank_list)} blank pages for stripping")
+
+    output_dir = Path(settings.output_folder)
+    child_paths = split_pdf(file_path, validated, output_dir, base, blank_list)
+
+    return JSONResponse({
+        "child_paths": [str(p) for p in child_paths],
+        "count": len(child_paths),
+        "boundaries": validated,
+        "blank_pages_removed": blank_list or [],
     })
