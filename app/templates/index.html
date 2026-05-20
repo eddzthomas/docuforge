@@ -1786,6 +1786,11 @@
         <div class="modal" id="modal-content" data-od-id="modal-content"></div>
     </div>
 
+    <!-- Split Review Modal -->
+    <div class="modal-overlay" id="split-review-overlay" data-od-id="split-review-overlay">
+        <div class="modal sr-modal" id="split-review-content" data-od-id="split-review-content"></div>
+    </div>
+
     <!-- PDF Viewer Overlay -->
     <div class="pdf-viewer-overlay" id="pdf-viewer-overlay" data-od-id="pdf-viewer-overlay">
         <div class="pdf-viewer-header" data-od-id="pdf-viewer-header">
@@ -2792,6 +2797,12 @@
 
         const masterChk = document.getElementById('tab-split-select-all');
         if (masterChk) masterChk.checked = true;
+
+        // Show the Review Splits button
+        const resultEl = document.getElementById('split-tab-result');
+        if (resultEl) {
+            resultEl.innerHTML = `<button class="btn btn-primary" onclick="openSplitReviewModal('${jobId}')" style="margin-top: 12px;">Review Splits</button>`;
+        }
     }
 
     function toggleTabSplitSelectAll() {
@@ -2879,9 +2890,9 @@
             if (res.ok) {
                 const data = await res.json();
                 if (resultEl) {
-                    resultEl.innerHTML = `<div style="color:var(--success); margin-top: 12px;">Split complete — ${data.child_count} documents created</div>`;
+                    resultEl.innerHTML = `<div style="color:var(--success); margin-top: 12px;">Split complete — ${data.child_count} documents awaiting approval</div>`;
                 }
-                showToast(`Split into ${data.child_count} documents`, 'success');
+                showToast(`Split into ${data.child_count} documents (awaiting approval)`, 'success');
                 if (previewDiv) {
                     previewDiv.classList.add('hidden');
                     document.getElementById('split-tab-progress').classList.add('hidden');
@@ -2895,6 +2906,231 @@
         finally {
             if (btn) { btn.disabled = false; btn.textContent = 'Approve Selected & Split'; }
         }
+    }
+
+    // ---- Split Review Modal ----
+    let srReviewData = null;
+    const srOverlay = document.getElementById('split-review-overlay');
+    const srContent = document.getElementById('split-review-content');
+
+    async function openSplitReviewModal(jobId) {
+        try {
+            const res = await fetch(`/api/jobs/${jobId}/split-review`);
+            if (!res.ok) {
+                const err = await res.json();
+                showToast(err.detail || 'Failed to load review', 'error');
+                return;
+            }
+            srReviewData = await res.json();
+        } catch (err) { showToast('Network error', 'error'); return; }
+
+        const d = srReviewData;
+        const conf = JSON.stringify(d.boundaries || []);
+        const ch = d.children || [];
+
+        srContent.innerHTML = `
+            <div class="modal-header">
+                <h3 class="modal-title">Split Review — ${d.page_count} pages</h3>
+                <button class="modal-close" onclick="closeSplitReview()">&times;</button>
+            </div>
+
+            <div class="sr-page-strip" id="sr-page-strip">
+                ${d.page_urls.map((url, i) => {
+                    let classes = 'sr-thumb';
+                    return `<div class="${classes}" data-page="${i}" onclick="srShowPage(${i})">
+                        <img src="${url}" loading="lazy">
+                        <span>${i + 1}</span>
+                    </div>`;
+                }).join('')}
+            </div>
+
+            <div class="sr-handles-bar" id="sr-handles-bar">
+                ${(function() {
+                    let html = '';
+                    for (let i = 0; i < d.page_count - 1; i++) {
+                        const idx = d.boundaries.indexOf(i + 1);
+                        const hasBorder = idx !== -1;
+                        const conf = hasBorder ? (d.confidences[idx] || 0) : 0;
+                        let colorClass = '';
+                        if (hasBorder) {
+                            colorClass = conf >= 0.7 ? 'sr-handle-high' : 'sr-handle-low';
+                        }
+                        html += `<div class="sr-handle-space">
+                            <div class="sr-handle ${hasBorder ? 'sr-handle-active ' + colorClass : ''}"
+                                 data-boundary="${i + 1}" onclick="srToggleHandle(this)">
+                            </div>
+                        </div>`;
+                    }
+                    return html;
+                })()}
+            </div>
+
+            <div class="sr-page-viewer">
+                <button class="btn btn-ghost btn-sm" onclick="srPrevPage()">Prev</button>
+                <div class="sr-page-container">
+                    <img id="sr-page-img" src="${d.page_urls[0]}" alt="Page">
+                    <span id="sr-page-label">Page 1 of ${d.page_count}</span>
+                </div>
+                <button class="btn btn-ghost btn-sm" onclick="srNextPage()">Next</button>
+            </div>
+
+            <div class="sr-info" id="sr-split-info">
+                ${ch.map(c => {
+                    let confHtml = '';
+                    if (c.confidence !== null) {
+                        const pct = Math.round(c.confidence * 100);
+                        const cls = c.confidence >= 0.7 ? 'sr-conf-high' : 'sr-conf-low';
+                        confHtml = `<span class="${cls}">${pct}%</span>`;
+                    }
+                    return `<div class="sr-child-info">
+                        <span>Doc ${c.index}: pages ${c.start_page}–${c.end_page} (${c.page_count} pgs)</span>
+                        ${confHtml}
+                    </div>`;
+                }).join('')}
+            </div>
+
+            <div class="modal-actions">
+                <button class="btn btn-ghost" onclick="closeSplitReview()">Cancel</button>
+                <button class="btn btn-primary" onclick="srConfirmSplits()">Confirm &amp; Create Child Jobs</button>
+            </div>
+        `;
+
+        srCurrentPage = 0;
+        srOverlay.classList.add('open');
+
+        // Scroll page strip to show handles alignment
+        const strip = document.getElementById('sr-page-strip');
+        if (strip) {
+            strip.scrollLeft = 0;
+        }
+        srShowPage(0);
+    }
+
+    function closeSplitReview() {
+        srOverlay.classList.remove('open');
+        if (srReviewData) {
+            fetch(`/api/jobs/${srReviewData.job_id}/split-cache`, { method: 'DELETE' }).catch(() => {});
+        }
+        srReviewData = null;
+    }
+
+    let srCurrentPage = 0;
+
+    function srShowPage(n) {
+        const d = srReviewData;
+        if (!d || n < 0 || n >= d.page_count) return;
+        srCurrentPage = n;
+        const img = document.getElementById('sr-page-img');
+        if (img) img.src = d.page_urls[n];
+        const label = document.getElementById('sr-page-label');
+        if (label) label.textContent = `Page ${n + 1} of ${d.page_count}`;
+        // Highlight active thumbnail
+        document.querySelectorAll('.sr-thumb').forEach((el, i) => {
+            el.classList.toggle('sr-thumb-active', i === n);
+        });
+    }
+
+    function srPrevPage() { if (srCurrentPage > 0) srShowPage(srCurrentPage - 1); }
+    function srNextPage() {
+        if (srReviewData && srCurrentPage < srReviewData.page_count - 1) srShowPage(srCurrentPage + 1);
+    }
+
+    function srToggleHandle(el) {
+        const boundary = parseInt(el.dataset.boundary);
+        const idx = srReviewData.boundaries.indexOf(boundary);
+        const settingsConf = 0.7;
+
+        if (idx !== -1) {
+            // Remove boundary
+            srReviewData.boundaries.splice(idx, 1);
+            srReviewData.confidences.splice(idx, 1);
+        } else {
+            // Add boundary
+            srReviewData.boundaries.push(boundary);
+            srReviewData.confidences.push(0.5);
+            srReviewData.boundaries.sort((a, b) => a - b);
+            srReviewData.confidences = srReviewData.boundaries.map((b, i) => {
+                const existingConf = srReviewData.confidences[i];
+                return existingConf !== undefined ? existingConf : 0.5;
+            });
+        }
+
+        // Update handles and child info
+        refreshSrUI();
+    }
+
+    function refreshSrUI() {
+        const d = srReviewData;
+        const conf = d.confidences;
+        const boundaries = d.boundaries;
+
+        // Update handles
+        document.querySelectorAll('.sr-handle').forEach(el => {
+            const b = parseInt(el.dataset.boundary);
+            const idx = boundaries.indexOf(b);
+            if (idx !== -1) {
+                const c = conf[idx] || 0;
+                el.classList.add('sr-handle-active');
+                el.classList.toggle('sr-handle-high', c >= 0.7);
+                el.classList.toggle('sr-handle-low', c < 0.7);
+            } else {
+                el.classList.remove('sr-handle-active', 'sr-handle-high', 'sr-handle-low');
+            }
+        });
+
+        // Update child info
+        const start = 0;
+        const sorted = [...boundaries].sort((a, b) => a - b);
+        const children = [];
+        let s = 0;
+        for (const b of sorted) {
+            children.push({ start_page: s + 1, end_page: b, page_count: b - s, confidence: conf[sorted.indexOf(b)] || null });
+            s = b;
+        }
+        children.push({ start_page: s + 1, end_page: d.page_count, page_count: d.page_count - s, confidence: null });
+
+        const infoEl = document.getElementById('sr-split-info');
+        if (infoEl) {
+            infoEl.innerHTML = children.map((c, i) => {
+                let confHtml = '';
+                if (c.confidence !== null) {
+                    const pct = Math.round(c.confidence * 100);
+                    const cls = c.confidence >= 0.7 ? 'sr-conf-high' : 'sr-conf-low';
+                    confHtml = `<span class="${cls}">${pct}%</span>`;
+                }
+                return `<div class="sr-child-info">
+                    <span>Doc ${i + 1}: pages ${c.start_page}–${c.end_page} (${c.page_count} pgs)</span>
+                    ${confHtml}
+                </div>`;
+            }).join('');
+        }
+    }
+
+    async function srConfirmSplits() {
+        if (!srReviewData) return;
+        const jobId = srReviewData.job_id;
+        const boundaries = srReviewData.boundaries;
+
+        try {
+            const res = await fetch(`/api/jobs/${jobId}/split-confirm`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ boundaries }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                showToast(`Split into ${data.child_count} documents (awaiting approval)`, 'success');
+                closeSplitReview();
+                // Hide split tab preview
+                const pDiv = document.getElementById('split-tab-preview');
+                if (pDiv) pDiv.classList.add('hidden');
+                document.getElementById('split-tab-result').innerHTML = '';
+                refreshJobs();
+            } else {
+                const err = await res.json();
+                showToast(err.detail || 'Failed to confirm split', 'error');
+            }
+        } catch (err) { showToast('Network error', 'error'); }
     }
 
     // ---- Standalone Split Modal ----
@@ -3094,7 +3330,7 @@
             const res = await fetch(`/api/jobs/${jobId}/split-confirm`, {method: 'POST'});
             if (res.ok) {
                 const data = await res.json();
-                showToast(`Split into ${data.child_count} documents`, 'success');
+                showToast(`Split into ${data.child_count} documents (awaiting approval)`, 'success');
                 closeModal();
                 refreshJobs();
             } else {

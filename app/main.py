@@ -774,13 +774,36 @@ async def get_logs(limit: int = 100):
 # Sprint 7: Smart PDF Splitting
 # =============================================================================
 
+RENDER_CACHE_BASE = Path("/tmp/docuforge/renders")
+
+
+def _save_page_cache(job_id: str, images: list) -> None:
+    """Save rendered page images to the job cache directory so /split-page can serve them."""
+    import shutil
+    pages_dir = RENDER_CACHE_BASE / job_id / "pages"
+    if pages_dir.exists():
+        shutil.rmtree(pages_dir)
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    for i, img_path in enumerate(images):
+        page_path = pages_dir / f"page_{i}.png"
+        shutil.copy2(str(img_path), str(page_path))
+
+
+def _clear_render_cache(job_id: str) -> None:
+    """Remove the render cache directory for a job."""
+    import shutil
+    cache_dir = RENDER_CACHE_BASE / job_id
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+
 
 @app.post("/api/jobs/{job_id}/split-detect")
 async def run_split_detection(job_id: str):
     """
     Manually trigger split boundary detection on a specific job.
 
-    Re-renders pages at split_dpi and runs the detection engine.
+    Re-renders pages at split_dpi, saves them to a cache directory for
+    the review modal, and runs the detection engine.
     Returns the detected boundaries and confidences.
     """
     settings = get_settings()
@@ -797,9 +820,10 @@ async def run_split_detection(job_id: str):
     if not file_path.suffix.lower() == ".pdf":
         raise HTTPException(status_code=400, detail="Split detection only available for PDF files")
 
-    # Render at split DPI
+    # Render at split DPI and save to page cache for review modal
     job_manager.update_job(job_id, split_phase="rendering", split_progress_pct=0)
     split_images = pdf_to_images(file_path, settings.split_dpi)
+    _save_page_cache(job_id, split_images)
     job_manager.update_job(job_id, split_phase="detecting", split_progress_pct=5)
 
     detector = SplitDetector(settings)
@@ -827,6 +851,7 @@ async def run_split_detection(job_id: str):
         split_boundaries=split_result.get("boundaries", []),
         split_confidences=split_result.get("confidences", []),
         blank_pages_removed=split_result.get("blank_pages", []),
+        pages=len(split_images),
     )
 
     return JSONResponse(split_result)
@@ -879,6 +904,85 @@ async def get_split_preview(job_id: str):
     })
 
 
+@app.get("/api/jobs/{job_id}/split-review")
+async def get_split_review(job_id: str):
+    """
+    Return full review data for the split review modal, including page URLs
+    for the page strip viewer.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    if not job.file_path:
+        raise HTTPException(status_code=400, detail="Job has no file path")
+
+    file_path = Path(job.file_path)
+    if not file_path.suffix.lower() == ".pdf":
+        raise HTTPException(status_code=400, detail="Split detection only available for PDF files")
+
+    pages_dir = RENDER_CACHE_BASE / job_id / "pages"
+    cached = pages_dir.exists() and any(pages_dir.iterdir())
+    if not cached:
+        raise HTTPException(status_code=400, detail="No split cache found — run split-detect first")
+
+    page_count = job.pages or 0
+    boundaries = job.split_boundaries or []
+    confidences = job.split_confidences or []
+
+    children = []
+    start = 0
+    for i, b in enumerate(boundaries):
+        confidence = confidences[i] if i < len(confidences) else None
+        children.append({
+            "index": len(children) + 1,
+            "start_page": start + 1,
+            "end_page": b,
+            "page_count": b - start,
+            "confidence": confidence,
+        })
+        start = b
+    if start < page_count:
+        children.append({
+            "index": len(children) + 1,
+            "start_page": start + 1,
+            "end_page": page_count,
+            "page_count": page_count - start,
+            "confidence": None,
+        })
+
+    page_urls = [f"/api/jobs/{job_id}/split-page?page={i}" for i in range(page_count)]
+
+    return JSONResponse({
+        "job_id": job_id,
+        "page_count": page_count,
+        "boundaries": boundaries,
+        "confidences": confidences,
+        "children": children,
+        "page_urls": page_urls,
+        "blank_pages": job.blank_pages_removed or [],
+        "cached": True,
+    })
+
+
+@app.get("/api/jobs/{job_id}/split-page")
+async def get_split_page(job_id: str, page: int = 0):
+    """
+    Serve a cached rendered page PNG. N is 0-indexed.
+    """
+    page_path = RENDER_CACHE_BASE / job_id / "pages" / f"page_{page}.png"
+    if not page_path.exists():
+        raise HTTPException(status_code=404, detail=f"Page {page} not found in cache — run split-detect first")
+
+    return FileResponse(str(page_path), media_type="image/png")
+
+
+@app.delete("/api/jobs/{job_id}/split-cache")
+async def clear_split_cache(job_id: str):
+    """Clear the render cache for a job after review is done or cancelled."""
+    _clear_render_cache(job_id)
+    return JSONResponse({"cleaned": True})
+
+
 @app.put("/api/jobs/{job_id}/split-points")
 async def adjust_split_points(job_id: str, body: dict):
     """
@@ -901,10 +1005,13 @@ async def adjust_split_points(job_id: str, body: dict):
 
 
 @app.post("/api/jobs/{job_id}/split-confirm")
-async def confirm_splits(job_id: str):
+async def confirm_splits(job_id: str, body: dict | None = None):
     """
     Confirm split boundaries → physically split PDF and create child jobs.
-    Each child enters the standard processing pipeline.
+    Children are created at AWAITING_APPROVAL — user must approve via
+    batch-approve to enqueue them into the processing pipeline.
+
+    Body (optional): {"boundaries": [3, 7]} — if provided, overrides job.split_boundaries
     """
     settings = get_settings()
     job = job_manager.get_job(job_id)
@@ -912,32 +1019,44 @@ async def confirm_splits(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
     if not job.file_path:
         raise HTTPException(status_code=400, detail="Job has no file path")
-    if not job.split_boundaries:
+
+    if body and body.get("boundaries") is not None:
+        new_boundaries = body["boundaries"]
+        if isinstance(new_boundaries, list) and all(isinstance(b, int) for b in new_boundaries):
+            new_boundaries = sorted(set(b for b in new_boundaries if 0 < b < (job.pages or float("inf"))))
+            job_manager.update_job(job_id, split_boundaries=new_boundaries, split_confidences=[])
+
+    boundaries = job.split_boundaries
+    if not boundaries:
         raise HTTPException(status_code=400, detail="No split boundaries defined")
 
     file_path = Path(job.file_path)
     child_paths = split_pdf(
         file_path,
-        job.split_boundaries,
+        boundaries,
         Path(settings.output_folder),
         file_path.stem,
         job.blank_pages_removed,
     )
 
-    # Create child jobs and enqueue
+    # Create child jobs at AWAITING_APPROVAL — NOT enqueued
     child_ids = []
     for i, child_path in enumerate(child_paths):
         child_job = job_manager.create_job(child_path.name)
+        child_job.status = JobStatus.AWAITING_APPROVAL
         child_job.job_type = "split_child"
         child_job.parent_job_id = job_id
+        child_job.file_path = str(child_path.resolve())
         child_ids.append(child_job.id)
-        job_queue.enqueue(child_job.id, child_path.resolve())
 
     job_manager.update_job(job_id,
         status=JobStatus.DONE,
         child_job_ids=child_ids,
     )
-    log_event("info", f"Split confirmed: {len(child_paths)} child documents created", job_id)
+    log_event("info", f"Split confirmed: {len(child_paths)} child documents awaiting approval", job_id)
+
+    # Clean up render cache on confirm
+    _clear_render_cache(job_id)
 
     return JSONResponse({
         "child_job_ids": child_ids,
@@ -967,7 +1086,15 @@ async def batch_approve(body: dict):
             errors.append(f"{jid}: not in awaiting_approval state")
             continue
 
-        # Finalize the job
+        # If this is a split child with no output file, enqueue it for processing
+        if job.job_type == "split_child" and not job.output_filename and job.file_path:
+            job.status = JobStatus.QUEUED
+            job_queue.enqueue(jid, Path(job.file_path))
+            log_event("info", f"Split child enqueued via batch approve: {job.original_name}", jid)
+            approved_count += 1
+            continue
+
+        # Finalize the job (rename + tag approval)
         output_dir = Path(get_settings().output_folder)
         proposed = job.proposed_name or Path(job.original_name).stem
         final_name = sanitize_filename(proposed)

@@ -165,6 +165,20 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 - Vision-model table region detection and OpenCV line detection are viable approaches but too heavy for Phase 3
 - Scheduled for evaluation after structured field extraction is stabilized
 
+### FR-16: Sample-Guided Split Detection
+- Users can optionally provide sample documents to guide split boundary detection with higher accuracy
+- **Two input modes:**
+  - Upload up to 5 sample PDFs/images as reference documents
+  - Select page ranges from the bulk PDF itself (e.g., pages 2–4 as one sample document)
+- **Similarity engine** uses perceptual hashing (`phash`) for fast 64-bit visual fingerprint comparison
+- **Sliding window** matching — multi-page samples are matched against consecutive page windows in the bulk
+- **LLM vision fallback** — when phash confidence is borderline (0.5–0.8), sends page pairs to Ollama vision model for verification: *"Are these pages from the same document type?"*
+- Sample-based boundaries are **merged** with the existing SplitDetector boundaries (union, deduplicate)
+- **Review modal** shows sample match per child document with confidence scores and match source (phash vs LLM-verified)
+- **Live threshold slider** in review modal allows re-computing boundaries from cached hashes without re-rendering
+- Sample storage persists in `data/samples/{job_id}/` (Docker volume) — survives container restarts
+- Configurable threshold (default 0.7) with higher values requiring stricter matching
+
 ## 5. Non-Functional Requirements
 
 | ID | Requirement | Detail |
@@ -217,15 +231,27 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | PDF rendering | **pdf2image** + **Poppler** | Render PDF pages to PNG |
 | OCR engine | **Tesseract** (CPU) or **GLM-OCR** via **Ollama** | Local, no cloud, dual-engine |
 | Text layering | **pikepdf** | Invisible text overlay at bounding box positions |
-| Renaming & tagging | **llama3.2 / mistral / phi4** via **Ollama** | LLM-powered document classification |
-| Classification | **llama3.2** via **Ollama** | Document type detection (invoice, contract, etc.) |
-| Field extraction | **llama3.2** via **Ollama** | Structured data extraction for invoices |
+| Renaming & tagging | **gemma4:e2b / llama3.2** via **Ollama** | LLM-powered document naming |
+| Classification | **gemma4:e2b / llama3.2** via **Ollama** | Document type detection (invoice, contract, etc.) |
+| Field extraction | **gemma4:e2b / llama3.2** via **Ollama** | Structured data extraction for invoices |
 | Text verification | **Statistical validation** | Bounding box sanity checks before PDF layering |
 | Split detection | **Tesseract** (heuristics) + **Vision model** via **Ollama** | Hybrid boundary detection for multi-doc PDFs |
 | PDF splitting | **pikepdf** | Page extraction and blank page removal |
+| Sample matching | **imagehash** (phash) + **gemma4:e2b** via **Ollama** | Perceptual hash similarity + LLM visual comparison |
 | Frontend | **Vanilla HTML/CSS/JS** | Zero build step, single-page app |
 | Container | **Docker** + **docker-compose** | One-command deployment |
 | GPU support | **NVIDIA Container Toolkit** | GPU passthrough to Ollama |
+
+### Recommended Model Configuration
+
+| Role | Model | VRAM | Why |
+|------|-------|------|-----|
+| **OCR** | `glm-ocr` | ~4GB | Purpose-built for OCR. Still the best single option. |
+| **Tag / Rename / Classify / Extract** | `gemma4:e2b` | ~7.2GB | Vision + text. 128K context. Thinking mode. One model for all text tasks. |
+| **Sample LLM fallback** | `gemma4:e2b` (reuse) | ~7.2GB | Vision comparison: "same document type?" No extra model needed. |
+| **Lightweight alternative** | `llama3.2` | ~2GB | Text-only. Fast. Good for low-VRAM setups. |
+
+> Set `TAGGING_MODEL=gemma4:e2b` to use Gemma 4 for all text LLM tasks. The model supports both text and vision APIs — compatible with all DocuForge features.
 
 ---
 
@@ -350,6 +376,14 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | `POST` | `/api/jobs/batch-approve` | Finalize metadata for multiple awaiting jobs |
 | `GET` | `/api/jobs/{id}/classify` | Get or regenerate document type classification |
 | `GET` | `/api/jobs/{id}/fields` | Get extracted structured fields (invoice date, amount, vendor) |
+| `GET` | `/api/jobs/{id}/split-review` | Get full review data with page URLs for modal |
+| `GET` | `/api/jobs/{id}/split-page` | Served cached page PNG for review modal |
+| `DELETE` | `/api/jobs/{id}/split-cache` | Clear render cache after review |
+| `POST` | `/api/jobs/{id}/split-samples/upload` | Upload sample files for guided detection |
+| `POST` | `/api/jobs/{id}/split-samples/from-bulk` | Select page range from bulk as sample |
+| `GET` | `/api/jobs/{id}/split-samples` | List sample documents for this job |
+| `DELETE` | `/api/jobs/{id}/split-samples/{sid}` | Remove a sample document |
+| `DELETE` | `/api/jobs/{id}/split-samples` | Clear all samples |
 
 ---
 
@@ -383,6 +417,9 @@ DocuForge solves all of these with a simple, self-hosted Docker application.
 | `EXTRACT_MODEL` | `llama3.2` | Ollama model for structured field extraction |
 | `RENAME_PROMPT_INVOICE` | *(see .env.example)* | Type-specific rename prompt for invoices {ocr_text} |
 | `RENAME_PROMPT_CONTRACT` | *(see .env.example)* | Type-specific rename prompt for contracts {ocr_text} |
+| `SPLIT_SAMPLE_THRESHOLD` | `0.7` | Phash confidence threshold for sample matching (0–1) |
+| `SPLIT_SAMPLE_LLM_FALLBACK` | `true` | Use LLM vision for borderline phash matches |
+| `SPLIT_SAMPLE_MAX_COUNT` | `5` | Maximum samples per split job (1–10) |
 
 ---
 

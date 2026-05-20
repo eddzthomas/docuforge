@@ -13,6 +13,10 @@ A `JobData` instance represents one document through its entire processing lifec
 ```
 queued → processing → awaiting_approval → done
                    ↘  failed
+                   
+Split workflow:
+queued → processing → awaiting_split_approval → done
+                         (split_parent only)    (children: queued → processing → ...)
 ```
 
 | State | Meaning |
@@ -47,7 +51,21 @@ queued → processing → awaiting_approval → done
 | `skip_rename` | `bool` | On upload | Sprint 7 | If `true`, LLM filename suggestion is skipped for this job. |
 | `skip_tags` | `bool` | On upload | Sprint 7 | If `true`, LLM tag suggestion is skipped for this job. |
 
-### 1.3 Planned Fields (Sprint 8)
+### 1.3 Split-Related Fields (Implemented)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `job_type` | `str \| None` | `"standard"`, `"split_parent"`, or `"split_child"`. Groups children under parent in UI. |
+| `parent_job_id` | `str \| None` | ID of the parent multi-doc PDF job. |
+| `child_job_ids` | `list[str]` | IDs of child jobs created by splitting. |
+| `split_boundaries` | `list[int]` | Page numbers where splits occur (0-based). |
+| `split_confidences` | `list[float]` | Confidence scores per boundary (0.0–1.0). |
+| `blank_pages_removed` | `list[int]` | Page numbers of detected blank pages that were stripped. |
+| `split_phase` | `str \| None` | Current split detection phase: `"rendering"`, `"detecting"`, `"done"`. |
+| `split_progress_pct` | `int` | Split detection progress 0–100. |
+| `split_sample_ids` | `list[str] \| None` | IDs of sample documents attached to this job (Sample Matcher feature). |
+
+### 1.4 Planned Fields (Sprint 8)
 
 | Field | Type | Required | Phase | Description |
 |-------|------|----------|-------|-------------|
@@ -55,17 +73,6 @@ queued → processing → awaiting_approval → done
 | `text_layer_score` | `int \| None` | After verify | 8.2 | Verification score 0–100. `None` if verification is disabled. |
 | `text_layer_warnings` | `list[str]` | After verify | 8.2 | Human-readable warning messages from verification checks. |
 | `extracted_fields` | `dict \| None` | After extraction | 8.3 | Invoice fields: `{"invoice_date": "...", "total_amount": "...", "vendor_name": "..."}`. `None` for non-invoices. |
-
-### 1.4 Planned Fields (Future Sprint 7)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `job_type` | `str` | `"standard"` or `"split_child"`. |
-| `parent_job_id` | `str \| None` | ID of the parent multi-doc PDF job. |
-| `child_job_ids` | `list[str]` | IDs of child jobs created by splitting. |
-| `split_boundaries` | `list[int]` | Page numbers where splits occur. |
-| `split_confidences` | `list[float]` | Confidence scores per boundary (0.0–1.0). |
-| `blank_pages_removed` | `list[int]` | Page numbers of detected blank pages that were stripped. |
 
 ### 1.5 API Serialization (`to_dict()`)
 
@@ -326,15 +333,23 @@ Only values that differ from pydantic defaults are persisted. See `app/config.py
 | `GET` | `/api/jobs/{id}/classify` | Get or regenerate document type classification. |
 | `GET` | `/api/jobs/{id}/fields` | Get extracted structured fields JSON. |
 
-### 4.14 Planned (Sprint 7)
+### 4.14 Implemented (Split & Samples)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/jobs/{id}/split-detect` | Run split boundary detection. |
-| `GET` | `/api/jobs/{id}/split-preview` | Get boundaries + thumbnails + proposed names. |
-| `PUT` | `/api/jobs/{id}/split-points` | Adjust split boundaries. |
-| `POST` | `/api/jobs/{id}/split-confirm` | Confirm splits → create child jobs. |
-| `POST` | `/api/jobs/batch-approve` | Finalize metadata for multiple awaiting jobs. |
+| `POST` | `/api/jobs/{id}/split-detect` | Run split boundary detection. Returns `{boundaries, confidences, blank_pages, engine, sample_matches}`. |
+| `GET` | `/api/jobs/{id}/split-preview` | Get boundaries + child doc ranges + sample match info. |
+| `GET` | `/api/jobs/{id}/split-review` | Full review data with `page_urls[]`, `cached` flag, children with `matched_sample`. |
+| `GET` | `/api/jobs/{id}/split-page?page=N` | Serve cached page PNG (0-indexed). Returns image/png. |
+| `PUT` | `/api/jobs/{id}/split-points` | Adjust split boundaries. Body: `{"boundaries": [int, ...]}`. |
+| `POST` | `/api/jobs/{id}/split-confirm` | Confirm splits → create child jobs at `AWAITING_APPROVAL`. Body: `{"boundaries": [...]}` (optional override). |
+| `DELETE` | `/api/jobs/{id}/split-cache` | Clear render cache. Returns `{"cleaned": true}`. |
+| `POST` | `/api/jobs/{id}/split-samples/upload` | Upload sample files (multipart, up to 5). |
+| `POST` | `/api/jobs/{id}/split-samples/from-bulk` | Select page range from bulk. Body: `{"name": "...", "start_page": 0, "end_page": 2}`. |
+| `GET` | `/api/jobs/{id}/split-samples` | List sample docs. Returns `{"samples": [{id, name, page_count, source}]}`. |
+| `DELETE` | `/api/jobs/{id}/split-samples/{sid}` | Remove one sample. |
+| `DELETE` | `/api/jobs/{id}/split-samples` | Clear all samples. |
+| `POST` | `/api/jobs/batch-approve` | Finalize metadata for multiple awaiting jobs (split children + rename approvals). Body: `{"job_ids": ["...", "..."]}`. |
 
 ---
 

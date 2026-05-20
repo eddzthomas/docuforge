@@ -1,5 +1,13 @@
 # Split Review & Manual Edit — Implementation Plan
 
+> **Status:** Partially implemented. The `openSplitPreview` modal (table-based child review) is
+> complete. Remaining work: remove Step 1.5 from pipeline, add page viewer/review endpoints,
+> change `/split-confirm` to `AWAITING_APPROVAL`, and add the full review modal with page strip
+> and handles.
+>
+> **Extended by:** [SAMPLE_MATCHING_PLAN.md](SAMPLE_MATCHING_PLAN.md) — adds sample-guided
+> detection (perceptual hash + LLM vision fallback) with select-from-bulk and threshold slider.
+
 ## Goal
 Decouple split detection from the upload/pipeline. The Split tab becomes the sole path
 for split detection + manual review + confirmation. Child jobs pause at AWAITING_APPROVAL

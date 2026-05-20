@@ -15,6 +15,7 @@ docker compose up --build
 
 # 2. Pull the AI models (in a second terminal)
 docker exec -it docuforge-ollama ollama pull glm-ocr
+docker exec -it docuforge-ollama ollama pull gemma4:e2b
 docker exec -it docuforge-ollama ollama pull llama3.2
 
 # 3. Open your browser
@@ -31,10 +32,21 @@ docker exec -it docuforge-ollama ollama pull llama3.2
 |------|-------------|
 | 1. Upload | Drag-and-drop scanned PDFs or images (PNG/JPG/TIFF/BMP) into the web UI |
 | 2. OCR | Each page is sent to **GLM-OCR** (running locally via Ollama) — text + bounding boxes |
-| 3. PDF/A | The original document is converted to **PDF/A-2b** archival format |
-| 4. Text layer | OCR'd text is layered onto the PDF/A — selectable, searchable, copyable |
-| 5. Tag & rename | An LLM reads the text and suggests a filename + up to 5 tags |
-| 6. Output | Final PDF saved to `./data/output/` with tags embedded in XMP metadata |
+| 3. Classify | LLM detects document type (invoice, contract, letter, report, form, quote, other) |
+| 4. Verify | Statistical bounding-box validation gates text layer quality (score 0-100) |
+| 5. Extract | For invoices: auto-extracts date, total amount, and vendor name to `.json` |
+| 6. PDF/A | The original document is converted to **PDF/A-2b** archival format |
+| 7. Text layer | OCR'd text is layered onto the PDF/A — selectable, searchable, copyable |
+| 8. Tag & rename | An LLM reads the text and suggests a filename + up to 5 tags |
+| 9. Output | Final PDF saved to `./data/output/` with tags embedded in XMP metadata |
+
+**Optional — Split Tab:**
+| Step | Description |
+|------|-------------|
+| Split detect | Detect multi-document boundaries in PDFs (blank pages, page numbers, headers, vision AI) |
+| Sample matching | Upload reference sample documents to guide boundary detection with higher accuracy |
+| Review & adjust | Interactive review modal — page strip viewer, draggable split handles, live confidence |
+| Batch approve | Approve all split children in one action; each child runs through the full pipeline |
 
 **Everything runs locally. Zero data leaves your machine.**
 
@@ -68,12 +80,27 @@ docker exec -it docuforge-ollama ollama pull llama3.2
 | Web server | FastAPI + Uvicorn (Python 3.11) |
 | PDF rendering | pdf2image + Poppler |
 | PDF/A conversion | pikepdf |
+| PDF splitting | pikepdf + SplitDetector |
 | Text layering | pypdf |
 | Image→PDF | img2pdf |
-| OCR engine | GLM-OCR via Ollama |
-| Tagging/rename LLM | llama3.2 / mistral / phi4 via Ollama |
+| OCR engine | GLM-OCR / Tesseract via Ollama |
+| Tagging/Classify/Extract LLM | llama3.2 / gemma4:e2b / gemma3:12b via Ollama |
+| Sample similarity | imagehash (perceptual hash) + Ollama vision model |
 | Frontend | Vanilla HTML/CSS/JS (zero build step) |
 | Container | Docker + docker-compose |
+
+### Recommended Models
+
+| Role | Model | VRAM | Notes |
+|------|-------|------|-------|
+| **OCR** | `glm-ocr` | ~4GB | Purpose-built for OCR. Still the best option. |
+| **Tag / Rename / Classify** | `gemma4:e2b` (Recommended) | ~7.2GB | Vision + text. 128K context. Thinking mode. Strong reasoning. |
+| **Tag / Rename / Classify** | `gemma3:12b` | ~8.1GB | Solid alternative. 128K context. Vision-capable. |
+| **Tag / Rename (light)** | `llama3.2` | ~2GB | Minimal VRAM. Text-only. Fast and reliable. |
+| **Sample LLM fallback** | `gemma4:e2b` | ~7.2GB | Vision model for page-pair comparison ("same document type?") |
+| **Sample LLM fallback** | `glm-ocr` (reuse) | ~4GB | Reuses existing OCR model — no extra download needed |
+
+> Setting `TAGGING_MODEL=gemma4:e2b` in `.env` uses the same model for rename, tag, classify, and field extraction. The model must be pulled into Ollama first.
 
 ---
 
@@ -164,6 +191,17 @@ Toggle the watcher on from the Upload tab in the web UI. Files are auto-detected
 | `GET` | `/api/watcher/status` | Folder watcher status |
 | `POST` | `/api/watcher/start` | Start folder watcher |
 | `POST` | `/api/watcher/stop` | Stop folder watcher |
+| `POST` | `/api/jobs/{id}/split-detect` | Run split boundary detection |
+| `GET` | `/api/jobs/{id}/split-preview` | Get split child doc preview |
+| `GET` | `/api/jobs/{id}/split-review` | Full review data with page URLs |
+| `GET` | `/api/jobs/{id}/split-page?page=N` | Served cached page PNG |
+| `PUT` | `/api/jobs/{id}/split-points` | Adjust split boundaries |
+| `POST` | `/api/jobs/{id}/split-confirm` | Confirm splits → create child jobs |
+| `DELETE` | `/api/jobs/{id}/split-cache` | Clear split render cache |
+| `POST` | `/api/jobs/{id}/split-samples/upload` | Upload sample docs for guided detection |
+| `POST` | `/api/jobs/{id}/split-samples/from-bulk` | Select page range from bulk as sample |
+| `GET` | `/api/jobs/{id}/split-samples` | List sample documents |
+| `POST` | `/api/jobs/batch-approve` | Finalize multiple awaiting jobs |
 
 ---
 
@@ -175,9 +213,12 @@ docuforge/
 │   ├── main.py            FastAPI application & routes
 │   ├── config.py          Settings loader + JSON persistence
 │   ├── processor.py       Pipeline orchestrator + JobQueue + watcher
-│   ├── ocr.py             GLM-OCR integration (Ollama)
-│   ├── tagger.py          LLM rename & tag (Ollama)
+│   ├── ocr.py             GLM-OCR / Tesseract integration (Ollama)
+│   ├── tagger.py          LLM rename, tag, classify, field extraction
 │   ├── pdf_utils.py       PDF/A conversion + text layering + tag embedding
+│   ├── verifier.py        Statistical bounding-box verification
+│   ├── splitter.py        SplitDetector — multi-doc boundary detection
+│   ├── sample_matcher.py  Sample-guided similarity matching (phash + LLM)
 │   ├── templates/
 │   │   └── index.html     Single-page web UI
 │   └── static/
@@ -187,9 +228,11 @@ docuforge/
 │   └── pull-models.sh
 ├── data/                   Host-mounted volume
 │   ├── uploads/            Input files
-│   └── output/             Processed PDFs
+│   ├── output/             Processed PDFs
+│   └── samples/            Sample documents for guided split detection
 ├── docker-compose.yml
 ├── docker-compose.gpu.yml
+├── docker-compose.remote-ollama.yml
 ├── Dockerfile
 ├── requirements.txt
 └── .env.example

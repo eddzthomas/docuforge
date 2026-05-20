@@ -31,6 +31,8 @@ app/
   tagger.py     -- LLM rename + tag + classify + field extraction via Ollama
   verifier.py   -- Statistical bounding-box validation before text layering
   pdf_utils.py  -- PDF/A conversion (pikepdf), text layering (pikepdf), tag embedding
+  splitter.py   -- SplitDetector for multi-page PDF boundary detection
+  sample_matcher.py -- Sample-based similarity matching (perceptual hash + LLM fallback)
   templates/index.html  -- Single-page web UI (vanilla JS, zero build step)
   static/style.css
 ```
@@ -44,11 +46,33 @@ Volumes: `./data/` → `/data/` (persists uploads, output, settings.json).
 - `get_settings()` is cached via `@lru_cache()`. After POST `/api/config`, must call `reload_settings()` to bust the cache.
 - `RENAME_PROMPT` **must** contain `{ocr_text}` placeholder — validated by pydantic field validator.
 - `ocr_engine` defaults to `"tesseract"` (CPU). Set to `"glm-ocr"` for Ollama vision model.
+- **Recommended LLM model:** `gemma4:e2b` (~7.2GB). Serves tagging, classification, field extraction, and sample LLM fallback. Vision + text. 128K context. Thinking mode. Falls back to `llama3.2` (~2GB) for low-VRAM setups.
 - Text layer verification is on by default (`VERIFY_TEXT_LAYER=true`). Stats-only check — no re-rendering. Score < `VERIFY_MIN_SCORE` (default 50) skips text layer for that page.
 - Document classification runs on first ~1000 chars of OCR text. Doc types: `letter`, `invoice`, `form`, `quote`, `contract`, `report`, `other`.
 - Structured field extraction ONLY fires for `doc_type == "invoice"`. Extracts 3 fields: invoice_date, total_amount, vendor_name. No line items (v2).
 - Type-specific rename prompts: `RENAME_PROMPT_INVOICE`, `RENAME_PROMPT_CONTRACT` (optional). Each must contain `{ocr_text}`. Falls back to generic `RENAME_PROMPT`.
 - Web UI Settings tab only exposes editable fields: `ollama_host`, `ocr_model`, `ocr_engine`, `tagging_model`, `dpi`, `pdfa_level`, `auto_rename`, `rename_prompt`, `max_file_size_mb`, `watch_interval`, `verify_text_layer`, `verify_min_score`, `extract_fields`. Path fields (`upload_folder`, `output_folder`) are NOT editable via UI.
+
+## Sample-Guided Split Detection
+
+The Split tab supports optional sample documents to guide boundary detection:
+
+- **Sample sources:** Upload up to 5 sample PDFs/images, or select page ranges from the bulk PDF itself.
+- **Storage:** Samples are stored in `data/samples/{job_id}/` — survives restarts unlike `/tmp` caches.
+- **Similarity method:** Perceptual hashing (`imagehash` library) for speed, with LLM vision fallback for borderline cases.
+- **Sliding window:** Multi-page samples are matched using a sliding window approach across bulk pages.
+- **Augmentation:** Sample-based boundaries are **merged** with the existing SplitDetector boundaries (union, deduplicate).
+
+**Config settings for sample matching:**
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `SPLIT_SAMPLE_THRESHOLD` | `0.7` | Phash confidence threshold (0-1). Higher = stricter matching. |
+| `SPLIT_SAMPLE_LLM_FALLBACK` | `true` | Use LLM vision for borderline phash matches (0.5–0.8 confidence). |
+| `SPLIT_SAMPLE_MAX_COUNT` | `5` | Maximum samples per split job. |
+
+**Key files:**
+- `app/sample_matcher.py` — SampleManager, SimilarityEngine, LLMFallbackComparer
 
 ## Processing pipeline (one-at-a-time)
 
@@ -63,6 +87,8 @@ Volumes: `./data/` → `/data/` (persists uploads, output, settings.json).
 9. **Structured field extraction** — if `doc_type == "invoice"`, LLM extracts date, total_amount, vendor_name. Saved as `.json` alongside output PDF.
 10. If `AUTO_RENAME=false` (default), job pauses at `awaiting_approval` — user must approve name/tags via UI.
 11. Tags are embedded in XMP metadata (`dc:subject`, `pdf:Keywords`) and in `docuforge:tags` custom namespace.
+
+**Note:** Split detection was previously Step 1.5 in the pipeline. It has been moved entirely to the Split tab as a separate workflow. Child jobs created by splitting pause at `AWAITING_APPROVAL` until approved via batch-approve.
 
 ## File conventions
 
@@ -87,3 +113,5 @@ Volumes: `./data/` → `/data/` (persists uploads, output, settings.json).
 - `pdf2image` calls poppler's `pdftoppm` binary — the `poppler-utils` apt package is required in the Docker image.
 - Tesseract OCR uses TSV output to get per-word bounding boxes via `pytesseract.image_to_data()`.
 - The entrypoint script `docker-entrypoint.sh` runs before uvicorn and handles auto-pulling models.
+- Split detection is now decoupled from `process_file()` — it runs exclusively in the Split tab. Children from splitting pause at `AWAITING_APPROVAL` (not `AWAITING_SPLIT_APPROVAL`).
+- Sample storage uses `data/samples/{job_id}/` (persistent Docker volume), unlike render caches which are in `/tmp/docuforge/renders`.

@@ -457,6 +457,115 @@ Show section when `job.doc_type === "invoice"` and `job.extracted_fields` exists
 
 ---
 
+## Sprint 9 — Split Review Decoupling
+
+### Overview
+
+Decouple split detection from the upload pipeline. The Split tab becomes the sole path for detection + review + confirmation. Child jobs pause at `AWAITING_APPROVAL` instead of auto-enqueuing.
+
+### New / Modified Files
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `app/processor.py` | Modify | **Remove** Step 1.5 block (lines 401–481). Auto-split logic removed. |
+| `app/main.py` | Modify | Add `GET /split-review`, `GET /split-page`, `DELETE /split-cache`. Modify `/split-detect` to save rendered pages to cache. Modify `/split-confirm` to set `AWAITING_APPROVAL` instead of enqueuing. |
+| `app/templates/index.html` | Modify | Review modal with page strip, full page viewer, draggable split handles, confidence coloring. |
+| `app/static/style.css` | Modify | Modal overlay, split handle styles, confidence color classes. |
+
+### Pipeline Changes
+
+- Lines 401–481 of `process_file()` removed — split detection no longer in pipeline
+- `split_phase` / `split_progress_pct` stay on `JobData` (set by Split tab endpoints)
+- `AWAITING_SPLIT_APPROVAL` kept for backward compat, but pipeline no longer sets it
+- Steps 1–7 unchanged (no renumbering — the split gate is simply gone)
+
+### Confirmation Flow Change
+
+**Before:** `/split-confirm` creates child jobs → immediately `enqueue()` → children process automatically.
+
+**After:** `/split-confirm` creates child jobs → sets status `AWAITING_APPROVAL` → user approves via batch-approve tab → batch-approve `enqueue()`s them.
+
+### Cache Structure
+
+```
+/tmp/docuforge/renders/{job_id}/
+  pages/
+    page_0.png       # Rendered at split_dpi for page viewer
+    page_1.png       ...
+  thumbnails/
+    child_1.png      # First page of each detected child
+    child_2.png      ...
+```
+
+- Renders at 150 dpi (split_dpi)
+- Cleaned on `/split-confirm` or `/split-cache` DELETE
+- Not a Docker volume — wiped on container restart
+
+---
+
+## Sprint 10 — Sample-Guided Split Detection
+
+### Overview
+
+Users can upload or select sample documents that guide boundary detection. Uses perceptual hashing (phash via `imagehash`) for fast comparison with LLM vision fallback for borderline cases. Augments the existing SplitDetector.
+
+### New / Modified Files
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `app/sample_matcher.py` | **Create** | SampleManager, SimilarityEngine, LLMFallbackComparer |
+| `app/main.py` | Modify | 5 new sample endpoints. Integrate sample comparison into `/split-detect`. Extend `/split-preview` with sample match data. |
+| `app/config.py` | Modify | Add `split_sample_threshold`, `split_sample_llm_fallback`, `split_sample_max_count` |
+| `app/templates/index.html` | Modify | Sample upload/select UI, select-from-bulk modal, review modal updates (match column, threshold slider) |
+| `app/static/style.css` | Modify | Sample card styles, page selection grid, match indicator styles |
+| `requirements.txt` | Modify | Add `imagehash>=4.3.1` |
+
+### New API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/jobs/{jid}/split-samples/upload` | Upload sample files (multipart, up to 5) |
+| `POST` | `/api/jobs/{jid}/split-samples/from-bulk` | Select page range from bulk as sample |
+| `GET` | `/api/jobs/{jid}/split-samples` | List all samples for this job |
+| `DELETE` | `/api/jobs/{jid}/split-samples/{sid}` | Remove one sample |
+| `DELETE` | `/api/jobs/{jid}/split-samples` | Clear all samples |
+| `GET` | `/api/jobs/{jid}/split-bulk-thumbnails?page=N` | Bulk page thumbnail for selection UI |
+
+### Algorithm
+
+1. Render sample + bulk pages at split_dpi
+2. Compute 64-bit phash for every page via `imagehash`
+3. Sliding-window comparison: for each N-page sample, slide N-page window across bulk
+4. Map hamming distance → confidence: `confidence = max(0, 1 - distance / 30)`
+5. Borderline confidence (0.5–0.8) → send page pair to Ollama vision model: *"Are these from the same document type? Return JSON."*
+6. Derive boundaries from match transitions
+7. Union with SplitDetector boundaries, deduplicate
+
+### Config Additions
+
+```python
+split_sample_threshold: float = 0.7   # phash confidence threshold (0-1)
+split_sample_llm_fallback: bool = True  # LLM vision for borderline matches
+split_sample_max_count: int = 5       # max samples per job (hard limit)
+```
+
+### Dependencies
+
+```
+imagehash>=4.3.1
+```
+
+### Recommended Model: `gemma4:e2b`
+
+For LLM vision fallback (sample comparison) and general tagging/classification, `gemma4:e2b` is recommended:
+- 7.2GB blob, fits in 6GB+ VRAM
+- 128K context, vision + text + audio
+- OmniDocBench 1.5 score: 0.290 (lower is better — excellent for document comparison)
+- Thinking mode for reasoning tasks
+- Single model serves: tagging, classification, field extraction, and sample LLM fallback
+
+---
+
 ## Testing Strategy
 
 ### Phase 1 (Classifier)
@@ -484,5 +593,7 @@ Show section when `job.doc_type === "invoice"` and `job.extracted_fields` exists
 1. **Phase 1 first** — classifier has zero risk to existing pipeline
 2. **Phase 2 in parallel** — verification is independent, can deploy same day
 3. **Phase 3 after Phase 1 validated** — depends on `doc_type` being correct
+4. **Sprint 9 after Phases 1-3** — split review decoupling requires pipeline changes that affect the split workflow. Do after classifier/extraction are stable.
+5. **Sprint 10 after Sprint 9** — sample-guided detection builds on Sprint 9's review modal and cache infrastructure.
 
-Each phase deploys as a single commit after verification testing.
+Each phase/sprint deploys as a single commit after verification testing.
