@@ -1620,7 +1620,33 @@
                             </div>
                         </div>
 
-                        <div id="split-tab-progress" class="hidden" data-od-id="split-progress-container">
+                        <!-- Sample Documents Section -->
+                        <div class="form-group mt-6" id="split-samples-section" data-od-id="split-samples-section" style="border-top: 1px solid var(--border-subtle); padding-top: var(--space-5);">
+                            <label class="form-label" data-od-id="split-samples-label">Optional: Sample Documents</label>
+                            <p style="font-size: 12px; color: var(--fg-quaternary); margin-bottom: var(--space-3);" data-od-id="split-samples-hint">
+                                Upload reference documents or select pages from the bulk to improve split accuracy.
+                            </p>
+
+                            <div id="split-samples-cards" class="sample-cards" data-od-id="split-samples-cards"></div>
+
+                            <div class="flex items-center gap-3" style="margin-top: var(--space-2);" data-od-id="split-samples-actions">
+                                <div class="upload-zone sample-upload-zone" id="sample-upload-zone" style="padding: var(--space-3); flex: 1; min-height: 48px;" data-od-id="sample-upload-zone">
+                                    <span style="font-size: 12px; color: var(--fg-quaternary);">Drop sample files here (PDF, PNG, JPG)</span>
+                                    <input type="file" id="sample-file-input" accept=".pdf,.png,.jpg,.jpeg" multiple style="display:none;">
+                                </div>
+                                <button class="btn btn-ghost btn-sm" onclick="openBulkSelector()" data-od-id="bulk-selector-btn">Select from Bulk</button>
+                            </div>
+
+                            <div class="form-group mt-4" data-od-id="sample-threshold-group">
+                                <label class="form-label" style="font-size: 12px;" data-od-id="sample-threshold-label">
+                                    Similarity Threshold: <strong id="sample-threshold-value">0.7</strong>
+                                </label>
+                                <input type="range" id="sample-threshold-slider" min="0.3" max="0.95" step="0.05" value="0.7"
+                                       oninput="updateSampleThreshold()" style="width: 100%; margin-top: var(--space-1);" data-od-id="sample-threshold-slider">
+                            </div>
+                        </div>
+
+                        <div id="split-tab-progress" class="hidden" style="margin-top: var(--space-5);" data-od-id="split-progress-container">
                             <div class="progress-track" data-od-id="split-progress-track">
                                 <div class="progress-fill split" id="split-tab-progress-bar" style="width: 0%" data-od-id="split-progress-bar"></div>
                             </div>
@@ -1791,6 +1817,11 @@
         <div class="modal sr-modal" id="split-review-content" data-od-id="split-review-content"></div>
     </div>
 
+    <!-- Bulk Page Selector Modal -->
+    <div class="modal-overlay" id="bulk-selector-overlay" data-od-id="bulk-selector-overlay">
+        <div class="modal" id="bulk-selector-content" data-od-id="bulk-selector-content"></div>
+    </div>
+
     <!-- PDF Viewer Overlay -->
     <div class="pdf-viewer-overlay" id="pdf-viewer-overlay" data-od-id="pdf-viewer-overlay">
         <div class="pdf-viewer-header" data-od-id="pdf-viewer-header">
@@ -1843,7 +1874,7 @@
         if (viewName === 'settings') loadConfig();
         if (viewName === 'history') loadOutputPath();
         if (viewName === 'logs') refreshLogs();
-        if (viewName === 'split') loadSplitTabJobs();
+        if (viewName === 'split') { loadSplitTabJobs(); loadSamples(); }
     }
 
     function toggleSidebar() {
@@ -1860,7 +1891,7 @@
             if (view === 'history') refreshJobs();
             if (view === 'logs') refreshLogs();
             if (view === 'settings') loadConfig();
-            if (view === 'split') loadSplitTabJobs();
+            if (view === 'split') { loadSplitTabJobs(); loadSamples(); }
         }
     }
 
@@ -2636,7 +2667,8 @@
                     <div class="upload-zone-icon" style="font-size: 32px;">&#128194;</div>
                     <p style="margin: 8px 0; font-size: 14px; color: var(--fg-tertiary);">Drop a PDF here or click to browse</p>
                     <input type="file" id="split-file-input" accept=".pdf" style="display:none;">`;
-                initSplitTabUpload();
+    initSplitTabUpload();
+    initSampleUpload();
             }
 
             showToast('Uploaded — starting split detection...', 'info');
@@ -2645,6 +2677,229 @@
             showToast('Network error during upload', 'error');
             if (zone) zone.innerHTML = '<p style="color: var(--danger);">Upload failed — network error</p>';
         }
+    }
+
+    // ---- Sample Document Functions ----
+    function initSampleUpload() {
+        const zone = document.getElementById('sample-upload-zone');
+        const input = document.getElementById('sample-file-input');
+        if (!zone || !input) return;
+
+        zone.addEventListener('click', () => input.click());
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+            zone.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
+        });
+        ['dragenter', 'dragover'].forEach(evt => {
+            zone.addEventListener(evt, () => zone.classList.add('drag-over'));
+        });
+        ['dragleave', 'drop'].forEach(evt => {
+            zone.addEventListener(evt, () => zone.classList.remove('drag-over'));
+        });
+        zone.addEventListener('drop', e => {
+            const files = Array.from(e.dataTransfer.files);
+            handleSampleFiles(files);
+        });
+        input.addEventListener('change', () => {
+            if (input.files.length > 0) {
+                handleSampleFiles(Array.from(input.files));
+                input.value = '';
+            }
+        });
+    }
+
+    function getSplitJobId() {
+        const select = document.getElementById('split-tab-job-select');
+        return select?.value || null;
+    }
+
+    async function handleSampleFiles(files) {
+        const jobId = getSplitJobId();
+        if (!jobId) { showToast('Select a bulk PDF first', 'error'); return; }
+
+        const formData = new FormData();
+        files.forEach(f => formData.append('files', f));
+
+        try {
+            const res = await fetch(`/api/jobs/${jobId}/split-samples/upload`, {
+                method: 'POST', body: formData,
+            });
+            if (res.ok) {
+                const data = await res.json();
+                showToast(`Added ${data.added.length} sample(s)`, 'success');
+                loadSamples();
+            } else {
+                const err = await res.json();
+                showToast(err.detail || 'Failed to upload samples', 'error');
+            }
+        } catch (err) { showToast('Network error', 'error'); }
+    }
+
+    async function loadSamples() {
+        const jobId = getSplitJobId();
+        const cards = document.getElementById('split-samples-cards');
+        if (!cards || !jobId) { if (cards) cards.innerHTML = ''; return; }
+
+        try {
+            const res = await fetch(`/api/jobs/${jobId}/split-samples`);
+            const data = await res.json();
+            const samples = data.samples || [];
+            if (samples.length === 0) {
+                cards.innerHTML = '<span style="font-size:12px;color:var(--fg-quaternary)">No samples added yet</span>';
+            } else {
+                cards.innerHTML = samples.map(s => `
+                    <div class="sample-card">
+                        <span>${escapeHtml(s.name)}</span>
+                        <span class="sample-card-pages">(${s.page_count} pg)</span>
+                        <button class="sample-card-remove" onclick="removeSample('${jobId}', '${s.id}')" title="Remove">&times;</button>
+                    </div>
+                `).join('');
+            }
+        } catch (err) { cards.innerHTML = ''; }
+    }
+
+    async function removeSample(jobId, sampleId) {
+        try {
+            const res = await fetch(`/api/jobs/${jobId}/split-samples/${sampleId}`, { method: 'DELETE' });
+            if (res.ok) {
+                showToast('Sample removed', 'info');
+                loadSamples();
+            }
+        } catch (err) { showToast('Network error', 'error'); }
+    }
+
+    function updateSampleThreshold() {
+        const slider = document.getElementById('sample-threshold-slider');
+        const label = document.getElementById('sample-threshold-value');
+        if (slider && label) {
+            label.textContent = parseFloat(slider.value).toFixed(2);
+        }
+    }
+
+    // ---- Bulk Page Selector ----
+    const bulkOverlay = document.getElementById('bulk-selector-overlay');
+    const bulkContent = document.getElementById('bulk-selector-content');
+    let bulkSelectionStart = -1;
+    let bulkSelectionEnd = -1;
+
+    async function openBulkSelector() {
+        const jobId = getSplitJobId();
+        if (!jobId) { showToast('Select a bulk PDF first', 'error'); return; }
+
+        let job;
+        try {
+            const r = await fetch(`/api/jobs/${jobId}`);
+            job = await r.json();
+        } catch (err) { showToast('Failed to loading job info', 'error'); return; }
+
+        const pages = job.pages || 0;
+        if (pages === 0) {
+            showToast('Run split-detect first to render pages', 'error');
+            return;
+        }
+
+        bulkSelectionStart = -1;
+        bulkSelectionEnd = -1;
+
+        bulkContent.innerHTML = `
+            <div class="modal-header">
+                <h3 class="modal-title">Select Pages from Bulk PDF</h3>
+                <button class="modal-close" onclick="closeBulkSelector()">&times;</button>
+            </div>
+            <p style="font-size:12px;color:var(--fg-quaternary);margin-bottom:12px;">
+                Click a page to start, then click another to define a range. First click = start, second = end.
+            </p>
+            <div class="bulk-selector-grid" id="bulk-selector-grid">
+                ${Array.from({length: pages}, (_, i) => `
+                    <div class="bulk-selector-page" data-page="${i}" onclick="toggleBulkPage(this, ${i})">
+                        <img src="/api/jobs/${jobId}/split-bulk-thumbnails?page=${i}" loading="lazy">
+                        <span>${i + 1}</span>
+                    </div>
+                `).join('')}
+            </div>
+            <div style="margin-top:12px;font-size:13px;color:var(--fg-secondary);" id="bulk-selection-info">
+                Click pages to select a range
+            </div>
+            <hr style="border-color:var(--border-subtle);margin:12px 0;">
+            <div class="form-group">
+                <label class="form-label">Sample Name</label>
+                <input type="text" id="bulk-sample-name" class="form-input" placeholder="e.g. Invoice Template">
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-ghost" onclick="closeBulkSelector()">Cancel</button>
+                <button class="btn btn-primary" onclick="addSampleFromBulk('${jobId}')">Add as Sample</button>
+            </div>
+        `;
+        bulkOverlay.classList.add('open');
+    }
+
+    function closeBulkSelector() {
+        bulkOverlay.classList.remove('open');
+    }
+
+    function toggleBulkPage(el, pageNum) {
+        if (bulkSelectionStart === -1) {
+            bulkSelectionStart = pageNum;
+            bulkSelectionEnd = pageNum;
+        } else if (bulkSelectionEnd === pageNum && bulkSelectionStart === pageNum) {
+            // clicking same page twice - reset
+            bulkSelectionStart = -1;
+            bulkSelectionEnd = -1;
+        } else {
+            // second click - set end
+            bulkSelectionEnd = pageNum;
+            if (bulkSelectionEnd < bulkSelectionStart) {
+                [bulkSelectionStart, bulkSelectionEnd] = [bulkSelectionEnd, bulkSelectionStart];
+            }
+        }
+        refreshBulkSelection();
+    }
+
+    function refreshBulkSelection() {
+        document.querySelectorAll('.bulk-selector-page').forEach(el => {
+            const p = parseInt(el.dataset.page);
+            el.classList.remove('selected', 'range-start', 'range-end', 'in-range');
+            if (bulkSelectionStart === -1) return;
+            if (p === bulkSelectionStart) el.classList.add('selected', 'range-start');
+            else if (p === bulkSelectionEnd) el.classList.add('selected', 'range-end');
+            else if (p > bulkSelectionStart && p < bulkSelectionEnd) el.classList.add('in-range');
+        });
+        const info = document.getElementById('bulk-selection-info');
+        if (info && bulkSelectionStart >= 0) {
+            const count = bulkSelectionEnd - bulkSelectionStart + 1;
+            info.textContent = `Pages ${bulkSelectionStart + 1}–${bulkSelectionEnd + 1} selected (${count} pages)`;
+            const nameInput = document.getElementById('bulk-sample-name');
+            if (nameInput && !nameInput.value) {
+                nameInput.placeholder = `Sample ${bulkSelectionStart + 1}-${bulkSelectionEnd + 1}`;
+            }
+        }
+    }
+
+    async function addSampleFromBulk(jobId) {
+        if (bulkSelectionStart === -1 || bulkSelectionEnd === -1) {
+            showToast('Select a page range first', 'error');
+            return;
+        }
+        const name = document.getElementById('bulk-sample-name')?.value.trim() || '';
+
+        try {
+            const res = await fetch(`/api/jobs/${jobId}/split-samples/from-bulk`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name,
+                    start_page: bulkSelectionStart,
+                    end_page: bulkSelectionEnd,
+                }),
+            });
+            if (res.ok) {
+                showToast('Sample added from bulk', 'success');
+                closeBulkSelector();
+                loadSamples();
+            } else {
+                const err = await res.json();
+                showToast(err.detail || 'Failed to add sample', 'error');
+            }
+        } catch (err) { showToast('Network error', 'error'); }
     }
 
     async function loadSplitTabJobs() {

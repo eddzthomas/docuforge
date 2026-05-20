@@ -841,6 +841,68 @@ async def run_split_detection(job_id: str):
     )
     job_manager.update_job(job_id, split_phase="done", split_progress_pct=100)
 
+    # ---- Sample comparison (if samples exist) ----
+    sample_matches = []
+    try:
+        from app.sample_matcher import (
+            SampleManager, SimilarityEngine, LLMFallbackComparer,
+            compute_all_hashes, compute_sample_hashes, load_cached_hashes,
+        )
+        sm = SampleManager(job_id)
+        samples = sm.list_samples()
+        if samples and settings.split_engine != "off":
+            engine = SimilarityEngine(threshold=settings.split_sample_threshold)
+            bulk_hashes = compute_all_hashes(split_images)
+            sample_hashes = load_cached_hashes(sm)
+            if not sample_hashes:
+                sample_hashes = compute_sample_hashes(sm)
+
+            all_matches = []
+            for s in samples:
+                sh = sample_hashes.get(s["id"], [])
+                if not sh:
+                    continue
+                if len(sh) == 1:
+                    matches = engine.compare_first_page(sh, bulk_hashes)
+                else:
+                    matches = engine.compare(sh, bulk_hashes)
+                for m in matches:
+                    m["sample_id"] = s["id"]
+                    m["sample_name"] = s.get("name", s["id"])
+                all_matches.extend(matches)
+
+            # LLM fallback for borderline matches
+            if settings.split_sample_llm_fallback:
+                sample_page_map = {}
+                for s in samples:
+                    sample_page_map[s["id"]] = [Path(p) for p in s.get("page_paths", [])]
+                llm_model = settings.tagging_model or settings.ocr_model
+                comparer = LLMFallbackComparer(settings.ollama_host, model=llm_model)
+                all_matches = await comparer.verify_borderline(
+                    all_matches, split_images, sample_page_map)
+
+            # Filter to non-failed matches
+            all_matches = [m for m in all_matches if m.get("source") != "llm_failed"]
+
+            # Derive boundaries from sample matches
+            sample_boundaries = engine.find_boundaries(
+                all_matches, len(split_images))
+
+            # Merge with SplitDetector boundaries
+            existing = set(split_result.get("boundaries", []))
+            existing_confs = split_result.get("confidences", [])
+            for sb in sample_boundaries:
+                if sb["page"] not in existing:
+                    existing.add(sb["page"])
+                    split_result["boundaries"] = sorted(existing)
+            sample_matches = all_matches
+
+            log_event("info", f"Sample comparison: {len(sample_matches)} matches, "
+                      f"{len(sample_boundaries)} boundaries found", job_id)
+    except Exception as exc:
+        logger.warning(f"Sample comparison failed (non-blocking): {exc}")
+        log_event("warn", f"Sample comparison failed: {exc}", job_id)
+
     # Save thumbnails for preview
     from app.processor import _save_split_thumbnails
     job_tmp = Path(tempfile.mkdtemp(prefix=f"docuforge_{job_id}_"))
@@ -854,7 +916,10 @@ async def run_split_detection(job_id: str):
         pages=len(split_images),
     )
 
-    return JSONResponse(split_result)
+    return JSONResponse({
+        **split_result,
+        "sample_matches": sample_matches,
+    })
 
 
 @app.get("/api/jobs/{job_id}/split-preview")
@@ -952,6 +1017,17 @@ async def get_split_review(job_id: str):
 
     page_urls = [f"/api/jobs/{job_id}/split-page?page={i}" for i in range(page_count)]
 
+    # Load sample data if available
+    samples_data = []
+    try:
+        from app.sample_matcher import SampleManager
+        sm = SampleManager(job_id)
+        samples_data = sm.list_samples()
+        for s in samples_data:
+            s.pop("page_paths", None)
+    except Exception:
+        pass
+
     return JSONResponse({
         "job_id": job_id,
         "page_count": page_count,
@@ -961,6 +1037,8 @@ async def get_split_review(job_id: str):
         "page_urls": page_urls,
         "blank_pages": job.blank_pages_removed or [],
         "cached": True,
+        "samples": samples_data,
+        "sample_threshold": get_settings().split_sample_threshold,
     })
 
 
@@ -1002,6 +1080,188 @@ async def adjust_split_points(job_id: str, body: dict):
     job_manager.update_job(job_id, split_boundaries=new_boundaries, split_confidences=[])
 
     return JSONResponse({"boundaries": new_boundaries, "adjusted": True})
+
+
+# =============================================================================
+# Sample-Guided Split Detection (Sprint 10)
+# =============================================================================
+
+
+@app.post("/api/jobs/{job_id}/split-samples/upload")
+async def upload_split_samples(job_id: str, files: list[UploadFile] = File(...)):
+    """
+    Upload sample document files to guide split detection. Up to max_count samples.
+    Each file is rendered at split_dpi and stored in the sample cache.
+    """
+    settings = get_settings()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    from app.sample_matcher import SampleManager
+    from app.processor import pdf_to_images, image_to_pdf
+
+    sm = SampleManager(job_id)
+    existing = sm.list_samples()
+    if len(existing) >= settings.split_sample_max_count:
+        raise HTTPException(status_code=400,
+                            detail=f"Maximum {settings.split_sample_max_count} samples already added")
+
+    added = []
+    for upload_file in files[:settings.split_sample_max_count - len(existing)]:
+        tmp = Path(tempfile.mkdtemp(prefix="docuforge_sample_"))
+        try:
+            ext = Path(upload_file.filename).suffix.lower() if upload_file.filename else ""
+            tmp_path = tmp / upload_file.filename
+            contents = await upload_file.read()
+            tmp_path.write_bytes(contents)
+
+            if ext == ".pdf":
+                pages = pdf_to_images(tmp_path, settings.split_dpi)
+            elif ext in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
+                inter = image_to_pdf(tmp_path, tmp)
+                pages = pdf_to_images(inter, settings.split_dpi)
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported sample format: {ext}")
+
+            if not pages:
+                raise HTTPException(status_code=400, detail="No renderable pages in sample")
+
+            info = sm.add_sample_from_upload(pages, name=Path(upload_file.filename).stem)
+            info["rendered_pages"] = len(pages)
+            added.append(info)
+        finally:
+            import shutil
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    return JSONResponse({"added": added, "total": len(sm.list_samples())})
+
+
+@app.post("/api/jobs/{job_id}/split-samples/from-bulk")
+async def select_sample_from_bulk(job_id: str, body: dict):
+    """
+    Select a page range from the bulk PDF as a sample document.
+
+    Body: {"name": "Invoice Sample", "start_page": 2, "end_page": 4}
+    Pages are 0-indexed, inclusive end.
+    """
+    settings = get_settings()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    if not job.file_path:
+        raise HTTPException(status_code=400, detail="Job has no file path")
+
+    from app.sample_matcher import SampleManager
+    from app.processor import pdf_to_images
+
+    name = body.get("name", "Sample")
+    start = body.get("start_page")
+    end = body.get("end_page")
+    if start is None or end is None or start < 0 or end < start:
+        raise HTTPException(status_code=400, detail="Invalid page range")
+
+    sm = SampleManager(job_id)
+    if len(sm.list_samples()) >= settings.split_sample_max_count:
+        raise HTTPException(status_code=400,
+                            detail=f"Maximum {settings.split_sample_max_count} samples already added")
+
+    file_path = Path(job.file_path)
+    all_pages = pdf_to_images(file_path, settings.split_dpi)
+    if end >= len(all_pages):
+        raise HTTPException(status_code=400, detail=f"Page {end} out of range (max {len(all_pages) - 1})")
+
+    from PIL import Image
+    selected = []
+    for i in range(start, end + 1):
+        selected.append(Image.open(str(all_pages[i])))
+
+    info = sm.add_sample_from_bulk(selected, name=name, start_page=start, end_page=end)
+    return JSONResponse({"added": info, "total": len(sm.list_samples())})
+
+
+@app.get("/api/jobs/{job_id}/split-samples")
+async def list_split_samples(job_id: str):
+    """List all sample documents for a job."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    from app.sample_matcher import SampleManager
+    sm = SampleManager(job_id)
+    samples = sm.list_samples()
+    return JSONResponse({"samples": samples, "total": len(samples),
+                         "max": get_settings().split_sample_max_count})
+
+
+@app.delete("/api/jobs/{job_id}/split-samples/{sample_id}")
+async def remove_split_sample(job_id: str, sample_id: str):
+    """Remove a single sample document."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    from app.sample_matcher import SampleManager
+    sm = SampleManager(job_id)
+    if not sm.remove_sample(sample_id):
+        raise HTTPException(status_code=404, detail=f"Sample not found: {sample_id}")
+    return JSONResponse({"removed": sample_id})
+
+
+@app.delete("/api/jobs/{job_id}/split-samples")
+async def clear_split_samples(job_id: str):
+    """Remove all sample documents for a job."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    from app.sample_matcher import SampleManager
+    SampleManager(job_id).clear_all()
+    return JSONResponse({"cleared": True})
+
+
+@app.get("/api/jobs/{job_id}/split-bulk-thumbnails")
+async def get_bulk_thumbnail(job_id: str, page: int = 0):
+    """
+    Serve a small thumbnail of a bulk PDF page for the sample selection modal.
+    Renders at a very low DPI if not already cached.
+    """
+    settings = get_settings()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    if not job.file_path:
+        raise HTTPException(status_code=400, detail="Job has no file path")
+
+    # Try cached page first
+    cached = RENDER_CACHE_BASE / job_id / "pages" / f"page_{page}.png"
+    if cached.exists():
+        # Create thumbnail from cached full-size page
+        from PIL import Image
+        thumb = Image.open(str(cached))
+        thumb.thumbnail((160, 220))
+        buf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        thumb.save(buf.name, "PNG")
+        resp = FileResponse(buf.name, media_type="image/png")
+        import os as _os
+        resp.background = lambda: _os.unlink(buf.name)
+        return resp
+
+    # Fallback: render just this page at low DPI
+    from app.processor import pdf_to_images
+    file_path = Path(job.file_path)
+    pages = pdf_to_images(file_path, 72)
+    if page >= len(pages):
+        raise HTTPException(status_code=400, detail=f"Page {page} out of range")
+    from PIL import Image
+    thumb = Image.open(str(pages[page]))
+    thumb.thumbnail((160, 220))
+    buf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    thumb.save(buf.name, "PNG")
+    resp = FileResponse(buf.name, media_type="image/png")
+    import os as _os
+    resp.background = lambda: _os.unlink(buf.name)
+    return resp
 
 
 @app.post("/api/jobs/{job_id}/split-confirm")

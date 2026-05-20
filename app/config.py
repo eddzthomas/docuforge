@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import field_validator, Field
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     split_min_pages: int = 3
     split_blank_threshold: int = 245  # Pixel value (0-255); above this counts as "white"
     split_blank_pixel_pct: float = 0.95  # Fraction of pixels that must be "white" to flag blank
+    split_sample_threshold: float = Field(default=0.7, ge=0.0, le=1.0, description="Phash similarity threshold for sample matching")
+    split_sample_llm_fallback: bool = Field(default=True, description="Use LLM vision for borderline phash matches")
+    split_sample_max_count: int = Field(default=5, ge=1, le=10, description="Maximum number of samples per split job")
 
     # ---- Allowed file extensions ----
     allowed_extensions: set[str] = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
@@ -329,6 +332,9 @@ def get_editable_fields() -> list[str]:
         "split_min_pages",
         "split_blank_threshold",
         "split_blank_pixel_pct",
+        "split_sample_threshold",
+        "split_sample_llm_fallback",
+        "split_sample_max_count",
         "max_file_size_mb",
         "watch_interval",
     ]
