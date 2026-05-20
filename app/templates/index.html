@@ -2726,6 +2726,7 @@
             formData.append('files', file);
             formData.append('skip_rename', 'true');
             formData.append('skip_tags', 'true');
+            formData.append('skip_enqueue', 'true');
 
             xhr.upload.addEventListener('progress', (e) => {
                 if (e.lengthComputable) {

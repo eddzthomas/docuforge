@@ -177,6 +177,7 @@ async def upload_files(
     files: list[UploadFile] = File(...),
     skip_rename: str = Form("false"),
     skip_tags: str = Form("false"),
+    skip_enqueue: str = Form("false"),
 ):
     """
     Accept one or more files for processing.
@@ -188,6 +189,8 @@ async def upload_files(
     Optional form fields:
         skip_rename: "true" to skip LLM filename generation
         skip_tags: "true" to skip LLM tag generation
+        skip_enqueue: "true" to skip adding to processing queue
+            (use for files that need split detection first)
     """
     settings = get_settings()
     upload_dir = Path(settings.upload_folder)
@@ -197,6 +200,7 @@ async def upload_files(
     jobs_created = []
     do_skip_rename = skip_rename.lower() == "true"
     do_skip_tags = skip_tags.lower() == "true"
+    do_skip_enqueue = skip_enqueue.lower() == "true"
 
     for file in files:
         suffix = Path(file.filename).suffix.lower()
@@ -226,8 +230,11 @@ async def upload_files(
             skip_rename=do_skip_rename,
             skip_tags=do_skip_tags,
         )
-        job_queue.enqueue(job.id, file_path)
-        log_event("info", f"File queued: {file.filename}", job.id)
+        if not do_skip_enqueue:
+            job_queue.enqueue(job.id, file_path)
+            log_event("info", f"File queued: {file.filename}", job.id)
+        else:
+            log_event("info", f"File saved (not enqueued): {file.filename}", job.id)
 
         jobs_created.append(job.to_dict())
 

@@ -145,6 +145,7 @@ class JobData:
             "blank_pages_removed": self.blank_pages_removed,
             "split_progress_pct": self.split_progress_pct,
             "split_phase": self.split_phase,
+            "file_path": self.file_path,
         }
 
 
@@ -703,7 +704,7 @@ class JobQueue:
 
 
 # ---- Singleton queue ----
-job_queue = JobQueue(max_concurrency=1)
+job_queue = JobQueue(max_concurrency=2)
 
 # ---- Folder Watcher ----
 _watcher_task: Optional[asyncio.Task] = None
