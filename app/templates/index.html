@@ -2639,40 +2639,75 @@
 
     async function handleSplitTabFile(file) {
         const zone = document.getElementById('split-upload-zone');
-        if (zone) zone.innerHTML = '<p style="color: var(--fg-secondary);">Uploading ' + escapeHtml(file.name) + '...</p>';
+        const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
 
-        const formData = new FormData();
-        formData.append('files', file);
-        formData.append('skip_rename', 'true');
-        formData.append('skip_tags', 'true');
+        // Show upload progress bar
+        if (zone) zone.innerHTML = `
+            <p style="margin-bottom: 8px; font-size: 13px; color: var(--fg-secondary);">Uploading ${escapeHtml(file.name)} (${sizeMB} MB)...</p>
+            <div class="progress-track" style="height: 6px;">
+                <div class="progress-fill" id="upload-progress-bar" style="width: 0%; transition: width 0.3s ease;"></div>
+            </div>
+            <span style="font-size: 11px; color: var(--fg-quaternary); margin-top: 4px; display: block;" id="upload-progress-label">0%</span>
+        `;
 
-        try {
-            const res = await fetch('/api/upload', { method: 'POST', body: formData });
-            if (!res.ok) {
-                const err = await res.json();
-                showToast('Upload failed: ' + (err.detail || res.statusText), 'error');
-                if (zone) zone.innerHTML = '<p style="color: var(--danger);">Upload failed — try again</p>';
-                return;
-            }
-            const data = await res.json();
-            const jobId = data.jobs?.[0]?.id;
-            if (!jobId) { showToast('Upload succeeded but no job created', 'error'); return; }
+        // Use XMLHttpRequest for upload progress
+        const jobId = await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            const formData = new FormData();
+            formData.append('files', file);
+            formData.append('skip_rename', 'true');
+            formData.append('skip_tags', 'true');
 
-            await loadSplitTabJobs();
-            const select = document.getElementById('split-tab-job-select');
-            if (select) select.value = jobId;
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    const pct = Math.round((e.loaded / e.total) * 100);
+                    const bar = document.getElementById('upload-progress-bar');
+                    const label = document.getElementById('upload-progress-label');
+                    if (bar) bar.style.width = pct + '%';
+                    if (label) label.textContent = pct + '%';
+                }
+            });
 
-            if (zone) {
-                zone.innerHTML = `
-                    <div class="upload-zone-icon" style="font-size: 32px;">&#128194;</div>
-                    <p style="margin: 8px 0; font-size: 14px; color: var(--fg-tertiary);">Drop a PDF here or click to browse</p>
-                    <input type="file" id="split-file-input" accept=".pdf" style="display:none;">`;
-    initSplitTabUpload();
-    initSampleUpload();
-            }
+            xhr.addEventListener('load', () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try {
+                        const data = JSON.parse(xhr.responseText);
+                        resolve(data.jobs?.[0]?.id || null);
+                    } catch (e) {
+                        reject(new Error('Invalid response'));
+                    }
+                } else {
+                    try {
+                        const err = JSON.parse(xhr.responseText);
+                        reject(new Error(err.detail || 'Upload failed'));
+                    } catch (e) {
+                        reject(new Error('Upload failed: ' + xhr.status));
+                    }
+                }
+            });
 
-            showToast('Uploaded — starting split detection...', 'info');
-            setTimeout(() => executeTabDetect(), 500);
+            xhr.addEventListener('error', () => reject(new Error('Network error')));
+            xhr.open('POST', '/api/upload');
+            xhr.send(formData);
+        });
+
+        if (!jobId) { showToast('Upload succeeded but no job created', 'error'); return; }
+
+        await loadSplitTabJobs();
+        const select = document.getElementById('split-tab-job-select');
+        if (select) select.value = jobId;
+
+        if (zone) {
+            zone.innerHTML = `
+                <div class="upload-zone-icon" style="font-size: 32px;">&#128194;</div>
+                <p style="margin: 8px 0; font-size: 14px; color: var(--fg-tertiary);">Drop a PDF here or click to browse</p>
+                <input type="file" id="split-file-input" accept=".pdf" style="display:none;">`;
+            initSplitTabUpload();
+            initSampleUpload();
+        }
+
+        showToast('Uploaded — starting split detection...', 'info');
+        setTimeout(() => executeTabDetect(), 500);
         } catch (err) {
             showToast('Network error during upload', 'error');
             if (zone) zone.innerHTML = '<p style="color: var(--danger);">Upload failed — network error</p>';

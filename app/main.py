@@ -147,10 +147,10 @@ async def health_check():
                 if ps_resp.status_code == 200:
                     ps_data = ps_resp.json()
                     for model_info in ps_data.get("models", []):
-                        details = model_info.get("details", {})
-                        if "gpu" in str(details).lower() or details.get("gpu"):
+                        size_vram = model_info.get("size_vram", 0)
+                        if size_vram and size_vram > 0:
                             gpu_available = True
-                            gpu_info = str(details.get("gpu", ""))
+                            gpu_info = f"GPU VRAM: {round(size_vram / 1e9, 1)} GB ({model_info.get('name', 'model')})"
                             break
             except Exception:
                 pass  # /api/ps may not be available on older Ollama versions
