@@ -1495,6 +1495,17 @@
                         Process Files
                     </button>
 
+                    <div id="upload-progress-section" class="hidden" style="margin-top: var(--space-4);" data-od-id="upload-progress-section">
+                        <p id="upload-progress-text" style="font-size:13px;color:var(--fg-secondary);margin-bottom:8px;"></p>
+                        <div class="progress-track" style="height:6px;">
+                            <div class="progress-fill" id="upload-progress-bar" style="width:0%;transition:width 0.3s ease;"></div>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+                            <span id="upload-progress-label" style="font-size:11px;color:var(--fg-quaternary);">0%</span>
+                            <button class="btn btn-ghost btn-sm" id="upload-cancel-btn" onclick="cancelUpload()">Cancel</button>
+                        </div>
+                    </div>
+
                     <div class="watcher-bar" id="watcher-bar" data-od-id="watcher-bar">
                         <div class="watcher-content" data-od-id="watcher-content">
                             <span class="watcher-label" data-od-id="watcher-label">Folder Watcher</span>
@@ -1959,16 +1970,70 @@
         });
     }
 
+    let activeUploadXHR = null;
+
     async function processFiles() {
         if (pendingFiles.length === 0) return;
 
         processBtn.disabled = true;
-        processBtn.textContent = 'Uploading...';
+        processBtn.classList.add('hidden');
+
+        const progressSection = document.getElementById('upload-progress-section');
+        const progressBar = document.getElementById('upload-progress-bar');
+        const progressLabel = document.getElementById('upload-progress-label');
+        const progressText = document.getElementById('upload-progress-text');
+        const cancelBtn = document.getElementById('upload-cancel-btn');
+        if (progressSection) progressSection.classList.remove('hidden');
+        if (cancelBtn) cancelBtn.disabled = false;
 
         let uploadedCount = 0;
         let errorCount = 0;
+        const total = pendingFiles.length;
 
-        for (const file of pendingFiles) {
+        for (let i = 0; i < pendingFiles.length; i++) {
+            const file = pendingFiles[i];
+            if (progressText) progressText.textContent = `Uploading ${escapeHtml(file.name)} (${i + 1} of ${total})...`;
+
+            const result = await uploadFileWithProgress(file, (pct) => {
+                if (progressBar) progressBar.style.width = pct + '%';
+                if (progressLabel) progressLabel.textContent = pct + '%';
+            });
+
+            if (result === 'cancelled') {
+                if (progressText) progressText.textContent = 'Upload cancelled';
+                if (progressLabel) progressLabel.textContent = '';
+                if (progressBar) progressBar.style.width = '0%';
+                break;
+            }
+            if (result === 'error') {
+                errorCount++;
+            } else {
+                uploadedCount++;
+            }
+        }
+
+        pendingFiles = [];
+        renderFileList();
+        if (progressSection) progressSection.classList.add('hidden');
+        processBtn.classList.remove('hidden');
+        processBtn.disabled = false;
+        processBtn.textContent = 'Process Files';
+        activeUploadXHR = null;
+
+        if (uploadedCount > 0) {
+            showToast(`${uploadedCount} file(s) uploaded successfully`, 'success');
+            switchView('history');
+            refreshJobs();
+        }
+        if (errorCount > 0 && uploadedCount === 0) {
+            showToast(`${errorCount} file(s) failed to upload`, 'error');
+        }
+    }
+
+    function uploadFileWithProgress(file, onProgress) {
+        return new Promise((resolve) => {
+            const xhr = new XMLHttpRequest();
+            activeUploadXHR = xhr;
             const formData = new FormData();
             formData.append('files', file);
             const doRename = document.getElementById('skip-rename-chk').checked;
@@ -1976,34 +2041,34 @@
             formData.append('skip_rename', doRename ? 'false' : 'true');
             formData.append('skip_tags', doTags ? 'false' : 'true');
 
-            try {
-                const res = await fetch('/api/upload', { method: 'POST', body: formData });
-                if (!res.ok) {
-                    const err = await res.json();
-                    console.error('Upload failed:', err.detail || res.statusText);
-                    errorCount++;
-                    continue;
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable && onProgress) {
+                    onProgress(Math.round((e.loaded / e.total) * 100));
                 }
-                uploadedCount++;
-            } catch (err) {
-                console.error('Upload error:', err);
-                errorCount++;
-            }
-        }
+            });
 
-        pendingFiles = [];
-        renderFileList();
-        processBtn.disabled = false;
-        processBtn.textContent = 'Process Files';
+            xhr.addEventListener('load', () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve('ok');
+                } else {
+                    resolve('error');
+                }
+            });
 
-        if (uploadedCount > 0) {
-            showToast(`${uploadedCount} file(s) uploaded successfully`, 'success');
-            switchView('history');
-            refreshJobs();
+            xhr.addEventListener('error', () => resolve('error'));
+            xhr.addEventListener('abort', () => resolve('cancelled'));
+            xhr.open('POST', '/api/upload');
+            xhr.send(formData);
+        });
+    }
+
+    function cancelUpload() {
+        if (activeUploadXHR) {
+            activeUploadXHR.abort();
+            activeUploadXHR = null;
         }
-        if (errorCount > 0) {
-            showToast(`${errorCount} file(s) failed to upload`, 'error');
-        }
+        const cancelBtn = document.getElementById('upload-cancel-btn');
+        if (cancelBtn) cancelBtn.disabled = true;
     }
 
     // ---- Job Polling ----
@@ -2645,14 +2710,18 @@
         if (zone) zone.innerHTML = `
             <p style="margin-bottom: 8px; font-size: 13px; color: var(--fg-secondary);">Uploading ${escapeHtml(file.name)} (${sizeMB} MB)...</p>
             <div class="progress-track" style="height: 6px;">
-                <div class="progress-fill" id="upload-progress-bar" style="width: 0%; transition: width 0.3s ease;"></div>
+                <div class="progress-fill" id="split-upload-progress-bar" style="width: 0%; transition: width 0.3s ease;"></div>
             </div>
-            <span style="font-size: 11px; color: var(--fg-quaternary); margin-top: 4px; display: block;" id="upload-progress-label">0%</span>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+                <span style="font-size:11px;color:var(--fg-quaternary);" id="split-upload-progress-label">0%</span>
+                <button class="btn btn-ghost btn-sm" id="split-upload-cancel-btn" onclick="cancelSplitUpload()">Cancel</button>
+            </div>
         `;
 
         // Use XMLHttpRequest for upload progress
         const jobId = await new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
+            activeUploadXHR = xhr;
             const formData = new FormData();
             formData.append('files', file);
             formData.append('skip_rename', 'true');
@@ -2661,8 +2730,8 @@
             xhr.upload.addEventListener('progress', (e) => {
                 if (e.lengthComputable) {
                     const pct = Math.round((e.loaded / e.total) * 100);
-                    const bar = document.getElementById('upload-progress-bar');
-                    const label = document.getElementById('upload-progress-label');
+                    const bar = document.getElementById('split-upload-progress-bar');
+                    const label = document.getElementById('split-upload-progress-label');
                     if (bar) bar.style.width = pct + '%';
                     if (label) label.textContent = pct + '%';
                 }
@@ -2687,11 +2756,22 @@
             });
 
             xhr.addEventListener('error', () => reject(new Error('Network error')));
+            xhr.addEventListener('abort', () => resolve(null));
             xhr.open('POST', '/api/upload');
             xhr.send(formData);
         });
 
-        if (!jobId) { showToast('Upload succeeded but no job created', 'error'); return; }
+        if (!jobId) {
+            if (zone) {
+                zone.innerHTML = `
+                    <div class="upload-zone-icon" style="font-size: 32px;">&#128194;</div>
+                    <p style="margin: 8px 0; font-size: 14px; color: var(--fg-tertiary);">Drop a PDF here or click to browse</p>
+                    <input type="file" id="split-file-input" accept=".pdf" style="display:none;">`;
+                initSplitTabUpload();
+                initSampleUpload();
+            }
+            return;
+        }
 
         await loadSplitTabJobs();
         const select = document.getElementById('split-tab-job-select');
@@ -2708,9 +2788,21 @@
 
         showToast('Uploaded — starting split detection...', 'info');
         setTimeout(() => executeTabDetect(), 500);
-        } catch (err) {
-            showToast('Network error during upload', 'error');
-            if (zone) zone.innerHTML = '<p style="color: var(--danger);">Upload failed — network error</p>';
+    }
+
+    function cancelSplitUpload() {
+        if (activeUploadXHR) {
+            activeUploadXHR.abort();
+            activeUploadXHR = null;
+        }
+        const zone = document.getElementById('split-upload-zone');
+        if (zone) {
+            zone.innerHTML = `
+                <div class="upload-zone-icon" style="font-size: 32px;">&#128194;</div>
+                <p style="margin: 8px 0; font-size: 14px; color: var(--fg-tertiary);">Drop a PDF here or click to browse</p>
+                <input type="file" id="split-file-input" accept=".pdf" style="display:none;">`;
+            initSplitTabUpload();
+            initSampleUpload();
         }
     }
 
