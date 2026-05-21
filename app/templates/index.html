@@ -3115,22 +3115,24 @@
         if (resultEl) resultEl.innerHTML = '';
         splitDetectionActive = true;
 
-        try {
-            const res = await fetch(`/api/jobs/${jobId}/split-detect`, { method: 'POST' });
-            if (!res.ok) {
-                const err = await res.json();
-                showToast(err.detail || 'Detection failed', 'error');
+        // Fire-and-forget the POST — detection runs in background on server
+        fetch(`/api/jobs/${jobId}/split-detect`, { method: 'POST' })
+            .then(res => {
+                if (!res.ok) {
+                    splitDetectionActive = false;
+                    if (progressDiv) progressDiv.classList.add('hidden');
+                    if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
+                    res.json().then(err => showToast(err.detail || 'Detection failed', 'error')).catch(() => {});
+                }
+            })
+            .catch(() => {
+                splitDetectionActive = false;
                 if (progressDiv) progressDiv.classList.add('hidden');
                 if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
-                return;
-            }
-        } catch (err) {
-            showToast('Network error', 'error');
-            if (progressDiv) progressDiv.classList.add('hidden');
-            if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
-            return;
-        }
+                showToast('Network error', 'error');
+            });
 
+        // Start polling immediately — progress updates happen in background
         await pollSplitProgress(jobId);
         if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
     }
@@ -3140,6 +3142,7 @@
         const phaseLabel = document.getElementById('split-tab-phase-label');
         const phaseLabels = {
             rendering: 'Rendering pages...',
+            queued: 'Preparing detection...',
             detecting: 'Starting detection...',
             blank: 'Detecting blank pages...',
             page_numbers: 'Analyzing page numbers...',
@@ -3147,8 +3150,10 @@
             vision: 'Running vision model...',
             merging: 'Merging results...',
         };
+        let lastPct = -1;
+        let lastPhase = '';
 
-        for (let i = 0; i < 300; i++) {
+        for (let i = 0; i < 600; i++) {
             if (!splitDetectionActive) return;
             await new Promise(r => setTimeout(r, 1000));
             try {
@@ -3157,8 +3162,13 @@
                 const pct = job.split_progress_pct || 0;
                 const phase = job.split_phase || '';
 
-                if (progressBar) progressBar.style.width = pct + '%';
-                if (phaseLabel) phaseLabel.textContent = (phaseLabels[phase] || phase) + ' ' + pct + '%';
+                // Throttle DOM updates — only react to changes
+                if (pct !== lastPct || phase !== lastPhase) {
+                    lastPct = pct;
+                    lastPhase = phase;
+                    if (progressBar) progressBar.style.width = pct + '%';
+                    if (phaseLabel) phaseLabel.textContent = (phaseLabels[phase] || phase) + ' ' + pct + '%';
+                }
 
                 if (phase === 'done' || pct >= 100) {
                     if (progressBar) progressBar.style.width = '100%';

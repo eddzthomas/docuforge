@@ -807,11 +807,11 @@ def _clear_render_cache(job_id: str) -> None:
 @app.post("/api/jobs/{job_id}/split-detect")
 async def run_split_detection(job_id: str):
     """
-    Manually trigger split boundary detection on a specific job.
+    Trigger split boundary detection on a specific job.
 
-    Re-renders pages at split_dpi, saves them to a cache directory for
-    the review modal, and runs the detection engine.
-    Returns the detected boundaries and confidences.
+    Renders pages at split_dpi, saves them to cache, then returns 202
+    immediately. Detection runs as a background task — poll GET /api/jobs/{id}
+    for split_phase / split_progress_pct updates.
     """
     settings = get_settings()
     job = job_manager.get_job(job_id)
@@ -820,113 +820,129 @@ async def run_split_detection(job_id: str):
     if not job.file_path:
         raise HTTPException(status_code=400, detail="Job has no file path — cannot re-detect")
 
-    from app.splitter import SplitDetector
     from app.processor import pdf_to_images
 
     file_path = Path(job.file_path)
     if not file_path.suffix.lower() == ".pdf":
         raise HTTPException(status_code=400, detail="Split detection only available for PDF files")
 
-    # Render at split DPI and save to page cache for review modal
+    # Render pages at split DPI and save to cache (this is the only sync part)
     job_manager.update_job(job_id, split_phase="rendering", split_progress_pct=0)
     split_images = pdf_to_images(file_path, settings.split_dpi)
     _save_page_cache(job_id, split_images)
-    job_manager.update_job(job_id, split_phase="detecting", split_progress_pct=5)
+    job_manager.update_job(job_id, split_phase="queued", split_progress_pct=3, pages=len(split_images))
 
-    detector = SplitDetector(settings)
-
-    def on_progress(phase, pct):
-        job_manager.update_job(
-            job_id,
-            split_phase=phase,
-            split_progress_pct=min(pct, 99),
-        )
-
-    split_result = await detector.detect(
-        file_path, split_images, settings,
-        progress_callback=on_progress,
+    # Launch detection in background — return 202 immediately
+    bg_task = asyncio.create_task(
+        _run_detection_background(job_id, file_path, split_images, settings)
     )
-    job_manager.update_job(job_id, split_phase="done", split_progress_pct=100)
+    _ = bg_task  # suppress unused-variable warning
 
-    # ---- Sample comparison (if samples exist) ----
-    sample_matches = []
+    return JSONResponse(
+        {"status": "accepted", "pages": len(split_images), "job_id": job_id},
+        status_code=202,
+    )
+
+
+async def _run_detection_background(job_id: str, file_path: Path,
+                                    split_images: list, settings):
+    """
+    Background task: run SplitDetector + sample comparison + save thumbnails.
+
+    Updates job.split_phase / split_progress_pct as it progresses so the
+    frontend can poll GET /api/jobs/{id} for real-time feedback.
+    """
     try:
-        from app.sample_matcher import (
-            SampleManager, SimilarityEngine, LLMFallbackComparer,
-            compute_all_hashes, compute_sample_hashes, load_cached_hashes,
+        from app.splitter import SplitDetector
+
+        job_manager.update_job(job_id, split_phase="detecting", split_progress_pct=5)
+
+        detector = SplitDetector(settings)
+
+        def on_progress(phase, pct):
+            job_manager.update_job(
+                job_id,
+                split_phase=phase,
+                split_progress_pct=min(pct, 99),
+            )
+
+        split_result = await detector.detect(
+            file_path, split_images, settings,
+            progress_callback=on_progress,
         )
-        sm = SampleManager(job_id)
-        samples = sm.list_samples()
-        if samples and settings.split_engine != "off":
-            engine = SimilarityEngine(threshold=settings.split_sample_threshold)
-            bulk_hashes = compute_all_hashes(split_images)
-            sample_hashes = load_cached_hashes(sm)
-            if not sample_hashes:
-                sample_hashes = compute_sample_hashes(sm)
 
-            all_matches = []
-            for s in samples:
-                sh = sample_hashes.get(s["id"], [])
-                if not sh:
-                    continue
-                if len(sh) == 1:
-                    matches = engine.compare_first_page(sh, bulk_hashes)
-                else:
-                    matches = engine.compare(sh, bulk_hashes)
-                for m in matches:
-                    m["sample_id"] = s["id"]
-                    m["sample_name"] = s.get("name", s["id"])
-                all_matches.extend(matches)
+        # ---- Sample comparison (if samples exist) ----
+        sample_matches = []
+        try:
+            from app.sample_matcher import (
+                SampleManager, SimilarityEngine, LLMFallbackComparer,
+                compute_all_hashes, compute_sample_hashes, load_cached_hashes,
+            )
+            sm = SampleManager(job_id)
+            samples = sm.list_samples()
+            if samples and settings.split_engine != "off":
+                engine = SimilarityEngine(threshold=settings.split_sample_threshold)
+                bulk_hashes = compute_all_hashes(split_images)
+                sample_hashes = load_cached_hashes(sm)
+                if not sample_hashes:
+                    sample_hashes = compute_sample_hashes(sm)
 
-            # LLM fallback for borderline matches
-            if settings.split_sample_llm_fallback:
-                sample_page_map = {}
+                all_matches = []
                 for s in samples:
-                    sample_page_map[s["id"]] = [Path(p) for p in s.get("page_paths", [])]
-                llm_model = settings.tagging_model or settings.ocr_model
-                comparer = LLMFallbackComparer(settings.ollama_host, model=llm_model)
-                all_matches = await comparer.verify_borderline(
-                    all_matches, split_images, sample_page_map)
+                    sh = sample_hashes.get(s["id"], [])
+                    if not sh:
+                        continue
+                    if len(sh) == 1:
+                        matches = engine.compare_first_page(sh, bulk_hashes)
+                    else:
+                        matches = engine.compare(sh, bulk_hashes)
+                    for m in matches:
+                        m["sample_id"] = s["id"]
+                        m["sample_name"] = s.get("name", s["id"])
+                    all_matches.extend(matches)
 
-            # Filter to non-failed matches
-            all_matches = [m for m in all_matches if m.get("source") != "llm_failed"]
+                if settings.split_sample_llm_fallback:
+                    sample_page_map = {}
+                    for s in samples:
+                        sample_page_map[s["id"]] = [Path(p) for p in s.get("page_paths", [])]
+                    llm_model = settings.tagging_model or settings.ocr_model
+                    comparer = LLMFallbackComparer(settings.ollama_host, model=llm_model)
+                    all_matches = await comparer.verify_borderline(
+                        all_matches, split_images, sample_page_map)
 
-            # Derive boundaries from sample matches
-            sample_boundaries = engine.find_boundaries(
-                all_matches, len(split_images))
+                all_matches = [m for m in all_matches if m.get("source") != "llm_failed"]
+                sample_boundaries = engine.find_boundaries(all_matches, len(split_images))
+                existing = set(split_result.get("boundaries", []))
+                for sb in sample_boundaries:
+                    if sb["page"] not in existing:
+                        existing.add(sb["page"])
+                        split_result["boundaries"] = sorted(existing)
+                sample_matches = all_matches
+                log_event("info", f"Sample comparison: {len(sample_matches)} matches, "
+                          f"{len(sample_boundaries)} boundaries found", job_id)
+        except Exception as exc:
+            logger.warning(f"Sample comparison failed (non-blocking): {exc}")
+            log_event("warn", f"Sample comparison failed: {exc}", job_id)
 
-            # Merge with SplitDetector boundaries
-            existing = set(split_result.get("boundaries", []))
-            existing_confs = split_result.get("confidences", [])
-            for sb in sample_boundaries:
-                if sb["page"] not in existing:
-                    existing.add(sb["page"])
-                    split_result["boundaries"] = sorted(existing)
-            sample_matches = all_matches
+        # Save thumbnails
+        from app.processor import _save_split_thumbnails
+        job_tmp = Path(tempfile.mkdtemp(prefix=f"docuforge_{job_id}_"))
+        if split_result.get("boundaries"):
+            _save_split_thumbnails(split_images, split_result["boundaries"], job_tmp, job_id)
 
-            log_event("info", f"Sample comparison: {len(sample_matches)} matches, "
-                      f"{len(sample_boundaries)} boundaries found", job_id)
+        job_manager.update_job(job_id,
+            split_phase="done",
+            split_progress_pct=100,
+            split_boundaries=split_result.get("boundaries", []),
+            split_confidences=split_result.get("confidences", []),
+            blank_pages_removed=split_result.get("blank_pages", []),
+        )
+        log_event("info", f"Split detection complete: {file_path.name}", job_id)
+
     except Exception as exc:
-        logger.warning(f"Sample comparison failed (non-blocking): {exc}")
-        log_event("warn", f"Sample comparison failed: {exc}", job_id)
-
-    # Save thumbnails for preview
-    from app.processor import _save_split_thumbnails
-    job_tmp = Path(tempfile.mkdtemp(prefix=f"docuforge_{job_id}_"))
-    if split_result.get("boundaries"):
-        _save_split_thumbnails(split_images, split_result["boundaries"], job_tmp, job_id)
-
-    job_manager.update_job(job_id,
-        split_boundaries=split_result.get("boundaries", []),
-        split_confidences=split_result.get("confidences", []),
-        blank_pages_removed=split_result.get("blank_pages", []),
-        pages=len(split_images),
-    )
-
-    return JSONResponse({
-        **split_result,
-        "sample_matches": sample_matches,
-    })
+        logger.error(f"Split detection background task failed: {exc}")
+        job_manager.update_job(job_id, split_phase="failed", split_progress_pct=0)
+        log_event("error", f"Split detection failed: {exc}", job_id)
 
 
 @app.get("/api/jobs/{job_id}/split-preview")
