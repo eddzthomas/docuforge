@@ -83,6 +83,9 @@ async def lifespan(app: FastAPI):
     log_event("info", "DocuForge started, queue worker running")
     logger.info("Job queue worker started via lifespan")
 
+    # Warm-up probe to detect GPU in ollama (fires in background)
+    asyncio.create_task(_probe_ollama_gpu())
+
     yield  # App runs here
 
     # Shutdown
@@ -130,30 +133,30 @@ async def health_check():
     Health check endpoint for Docker HEALTHCHECK and load balancers.
 
     Returns the app status, Ollama connectivity state, and GPU
-    availability info for the Ollama runtime.
+    availability info for the Ollama runtime. Uses a warm-up probe
+    at startup to reliably detect GPU even when no model is loaded.
     """
     ollama_status = "disconnected"
-    gpu_available = False
-    gpu_info = None
+    gpu_available = _gpu_available_cached
+    gpu_info = _gpu_info_cached
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{settings.ollama_host}/api/tags")
             if response.status_code == 200:
                 ollama_status = "connected"
 
-            # Check if Ollama has GPU-accelerated models loaded
+            # Check if any model is currently loaded on GPU
             try:
                 ps_resp = await client.get(f"{settings.ollama_host}/api/ps")
                 if ps_resp.status_code == 200:
-                    ps_data = ps_resp.json()
-                    for model_info in ps_data.get("models", []):
+                    for model_info in ps_resp.json().get("models", []):
                         size_vram = model_info.get("size_vram", 0)
                         if size_vram and size_vram > 0:
                             gpu_available = True
                             gpu_info = f"GPU VRAM: {round(size_vram / 1e9, 1)} GB ({model_info.get('name', 'model')})"
                             break
             except Exception:
-                pass  # /api/ps may not be available on older Ollama versions
+                pass
     except Exception:
         ollama_status = "disconnected"
 
@@ -782,6 +785,46 @@ async def get_logs(limit: int = 100):
 # =============================================================================
 
 RENDER_CACHE_BASE = Path("/tmp/docuforge/renders")
+
+_gpu_available_cached = False
+_gpu_info_cached = None
+_gpu_probed = False
+
+
+async def _probe_ollama_gpu():
+    """Warm up Ollama with a tiny inference to detect GPU availability."""
+    global _gpu_available_cached, _gpu_info_cached, _gpu_probed
+    if _gpu_probed:
+        return
+    _gpu_probed = True
+    settings = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Send a tiny prompt to force model loading with GPU
+            resp = await client.post(
+                f"{settings.ollama_host}/api/generate",
+                json={
+                    "model": settings.tagging_model,
+                    "prompt": "test",
+                    "stream": False,
+                },
+            )
+            if resp.status_code == 200:
+                # Check /api/ps for GPU usage
+                ps_resp = await client.get(f"{settings.ollama_host}/api/ps")
+                if ps_resp.status_code == 200:
+                    for m in ps_resp.json().get("models", []):
+                        size_vram = m.get("size_vram", 0)
+                        if size_vram and size_vram > 0:
+                            _gpu_available_cached = True
+                            _gpu_info_cached = (
+                                f"GPU VRAM: {round(size_vram / 1e9, 1)} GB "
+                                f"({m.get('name', 'model')})"
+                            )
+                            logger.info(f"GPU detected via warm-up: {_gpu_info_cached}")
+                            break
+    except Exception as exc:
+        logger.warning(f"GPU warm-up probe failed (non-blocking): {exc}")
 
 
 def _save_page_cache(job_id: str, images: list) -> None:
