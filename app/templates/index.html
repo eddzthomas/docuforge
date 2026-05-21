@@ -2200,7 +2200,7 @@
                     <button class="btn btn-primary btn-sm" onclick="openPreviewModal('${job.id}')">Preview</button>
                     <button class="btn btn-ghost btn-sm" onclick="quickApprove('${job.id}')" style="margin-left: 4px;">Approve</button>`;
             } else if (job.status === 'awaiting_split_approval') {
-                actionsHtml = `<button class="btn btn-primary btn-sm" onclick="openSplitPreview('${job.id}')">Review (${(job.split_boundaries?.length || 0) + 1})</button>`;
+                actionsHtml = `<button class="btn btn-primary btn-sm" onclick="openSplitReviewModal('${job.id}')">Review (${(job.split_boundaries?.length || 0) + 1})</button>`;
             } else if (job.status === 'failed') {
                 const detailId = `detail-${job.id}`;
                 let btns = `<button class="btn btn-primary btn-sm" onclick="retryJob('${job.id}')">Retry</button>`;
@@ -3881,7 +3881,7 @@
             });
             if (res.ok) {
                 showToast('Boundaries updated', 'info');
-                openSplitPreview(jobId);
+                openSplitReviewModal(jobId);
             } else {
                 showToast('Failed to update boundaries', 'error');
             }
