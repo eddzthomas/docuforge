@@ -1312,6 +1312,8 @@ async def confirm_splits(job_id: str, body: dict | None = None):
         child_job = job_manager.create_job(child_path.name)
         child_job.status = JobStatus.AWAITING_APPROVAL
         child_job.job_type = "split_child"
+        child_job.skip_rename = True
+        child_job.skip_tags = True
         child_job.parent_job_id = job_id
         child_job.file_path = str(child_path.resolve())
         child_ids.append(child_job.id)

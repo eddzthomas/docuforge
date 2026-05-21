@@ -870,23 +870,30 @@ header p {
 /* ---- Split Review Modal ---- */
 
 .sr-modal {
-    min-width: 680px;
-    max-width: 860px;
-    max-height: 90vh;
+    min-width: 720px;
+    max-width: 95vw;
+    max-height: 95vh;
     overflow-y: auto;
 }
 
 .sr-page-strip {
     display: flex;
-    gap: 4px;
+    gap: 2px;
     overflow-x: auto;
     padding: 8px 0;
-    margin-bottom: 4px;
+    margin-bottom: 8px;
     scroll-behavior: smooth;
+    align-items: flex-start;
 }
 
-.sr-thumb {
+.sr-page-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
     flex-shrink: 0;
+}
+
+.sr-thumb-wrapper {
     cursor: pointer;
     border: 2px solid transparent;
     border-radius: 4px;
@@ -895,101 +902,121 @@ header p {
     position: relative;
 }
 
-.sr-thumb img {
-    width: 72px;
-    height: 96px;
+.sr-thumb-wrapper img {
+    width: 64px;
+    height: 86px;
     object-fit: cover;
     display: block;
 }
 
-.sr-thumb span {
+.sr-page-num {
     position: absolute;
     bottom: 2px;
     left: 2px;
-    font-size: 10px;
+    font-size: 9px;
     background: rgba(0,0,0,0.7);
     color: var(--fg-secondary);
-    padding: 1px 5px;
-    border-radius: 3px;
+    padding: 1px 4px;
+    border-radius: 2px;
 }
 
 .sr-thumb-active {
     border-color: var(--accent-interactive);
 }
 
-.sr-handles-bar {
-    display: flex;
-    align-items: center;
-    height: 24px;
-    padding: 0 calc(72px / 2 - 4px);
-    margin-bottom: 12px;
-    gap: 0;
-}
-
-.sr-handle-space {
-    flex: 1;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    height: 100%;
-}
+/* ---- Split Handle — integrated between thumbnails ---- */
 
 .sr-handle {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
+    width: 16px;
+    height: 24px;
+    border-radius: 3px;
     background: var(--border-standard);
     cursor: pointer;
-    transition: all 0.15s ease;
-    position: relative;
-}
-
-.sr-handle::after {
-    content: '';
-    position: absolute;
-    top: 50%;
-    left: 100%;
-    width: 0;
-    height: 0;
-    transform: translateY(-50%);
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    color: var(--fg-quaternary);
+    margin: 4px 0;
+    border: 1px solid transparent;
 }
 
 .sr-handle:hover {
-    transform: scale(1.4);
+    transform: scale(1.15);
     background: var(--fg-tertiary);
+    color: var(--fg-primary);
+    border-color: var(--accent-interactive);
 }
 
 .sr-handle-active {
-    width: 4px;
-    height: 24px;
-    border-radius: 2px;
+    width: 18px;
+    height: 34px;
+    border-radius: 4px;
+    font-weight: 700;
+    font-size: 9px;
+    border: 2px solid rgba(255,255,255,0.3);
 }
 
 .sr-handle-high {
-    background: var(--success, #3dd68c);
+    background: #1a6b3e;
+    color: #3dd68c;
+    border-color: #3dd68c;
 }
 
 .sr-handle-low {
-    background: var(--warning, #f0b429);
+    background: #6b4f1a;
+    color: #f0b429;
+    border-color: #f0b429;
 }
 
-.sr-page-viewer {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    margin-bottom: 16px;
-}
-
-.sr-page-container {
+.sr-handle-label {
+    white-space: nowrap;
     text-align: center;
 }
 
-.sr-page-container img {
-    max-width: 100%;
-    max-height: 45vh;
+.sr-handle-plus {
+    display: none;
+    font-size: 12px;
+    color: var(--fg-quaternary);
+}
+
+.sr-handle:not(.sr-handle-active):hover .sr-handle-plus {
+    display: block;
+    color: var(--fg-primary);
+}
+
+/* ---- Zoom Controls ---- */
+
+.sr-zoom-controls {
+    display: flex;
+    gap: 6px;
+    justify-content: center;
+    margin-bottom: 10px;
+}
+
+/* ---- Page Viewer ---- */
+
+.sr-page-viewer {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.sr-page-scroll {
+    flex: 1;
+    max-height: 55vh;
+    overflow: auto;
+    background: #fff;
     border: 1px solid var(--border-standard);
     border-radius: var(--radius-sm);
+    text-align: center;
+}
+
+.sr-page-scroll img {
+    display: block;
     background: #fff;
 }
 

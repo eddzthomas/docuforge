@@ -2768,7 +2768,8 @@
                     <div class="upload-zone-icon" style="font-size: 32px;">&#128194;</div>
                     <p style="margin: 8px 0; font-size: 14px; color: var(--fg-tertiary);">Drop a PDF here or click to browse</p>
                     <input type="file" id="split-file-input" accept=".pdf" style="display:none;">`;
-                initSplitTabUpload();
+    initSplitTabUpload();
+    initSampleUpload();
                 initSampleUpload();
             }
             return;
@@ -2813,19 +2814,35 @@
         const input = document.getElementById('sample-file-input');
         if (!zone || !input) return;
 
-        zone.addEventListener('click', () => input.click());
-        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
-            zone.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
+        // Remove old listeners by cloning (executed once on page load)
+        const newZone = zone.cloneNode(true);
+        zone.parentNode.replaceChild(newZone, zone);
+        const freshZone = document.getElementById('sample-upload-zone');
+        if (!freshZone) return;
+
+        freshZone.addEventListener('click', (e) => {
+            if (e.target.tagName !== 'BUTTON') input.click();
         });
         ['dragenter', 'dragover'].forEach(evt => {
-            zone.addEventListener(evt, () => zone.classList.add('drag-over'));
+            freshZone.addEventListener(evt, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                freshZone.classList.add('drag-over');
+            });
         });
-        ['dragleave', 'drop'].forEach(evt => {
-            zone.addEventListener(evt, () => zone.classList.remove('drag-over'));
+        ['dragleave'].forEach(evt => {
+            freshZone.addEventListener(evt, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                freshZone.classList.remove('drag-over');
+            });
         });
-        zone.addEventListener('drop', e => {
+        freshZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            freshZone.classList.remove('drag-over');
             const files = Array.from(e.dataTransfer.files);
-            handleSampleFiles(files);
+            if (files.length > 0) handleSampleFiles(files);
         });
         input.addEventListener('change', () => {
             if (input.files.length > 0) {
@@ -3308,8 +3325,34 @@
         } catch (err) { showToast('Network error', 'error'); return; }
 
         const d = srReviewData;
-        const conf = JSON.stringify(d.boundaries || []);
         const ch = d.children || [];
+        srZoomLevel = 1;
+        srZoomFit = true;
+
+        // Build page strip with integrated handles
+        let stripHtml = '';
+        for (let i = 0; i < d.page_count; i++) {
+            const boundaryAfter = d.boundaries.indexOf(i + 1) !== -1;
+            const confIdx = d.boundaries.indexOf(i + 1);
+            let handleHtml = '';
+            if (i < d.page_count - 1) {
+                const isBoundary = boundaryAfter;
+                const conf = confIdx !== -1 ? (d.confidences[confIdx] || 0) : 0;
+                const confPct = Math.round(conf * 100);
+                const high = conf >= 0.7;
+                handleHtml = `<div class="sr-handle ${isBoundary ? 'sr-handle-active ' + (high ? 'sr-handle-high' : 'sr-handle-low') : ''}"
+                    data-boundary="${i + 1}" onclick="srToggleHandle(this)" title="${isBoundary ? 'Click to remove split at page ' + (i + 1) + ' (' + confPct + '% confidence)' : 'Click to add split after page ' + (i + 1)}">
+                    ${isBoundary ? '<span class="sr-handle-label">' + confPct + '%</span>' : '<span class="sr-handle-plus">+</span>'}
+                </div>`;
+            }
+            stripHtml += `<div class="sr-page-wrap">
+                <div class="sr-thumb-wrapper ${i === 0 ? 'sr-thumb-active' : ''}" data-page="${i}" onclick="srShowPage(${i})">
+                    <img src="${d.page_urls[i]}" loading="lazy">
+                    <span class="sr-page-num">${i + 1}</span>
+                </div>
+                ${handleHtml}
+            </div>`;
+        }
 
         srContent.innerHTML = `
             <div class="modal-header">
@@ -3317,45 +3360,22 @@
                 <button class="modal-close" onclick="closeSplitReview()">&times;</button>
             </div>
 
-            <div class="sr-page-strip" id="sr-page-strip">
-                ${d.page_urls.map((url, i) => {
-                    let classes = 'sr-thumb';
-                    return `<div class="${classes}" data-page="${i}" onclick="srShowPage(${i})">
-                        <img src="${url}" loading="lazy">
-                        <span>${i + 1}</span>
-                    </div>`;
-                }).join('')}
+            <div class="sr-page-strip" id="sr-page-strip">${stripHtml}</div>
+
+            <div class="sr-zoom-controls">
+                <button class="btn btn-ghost btn-sm" onclick="srZoomIn()" title="Zoom in">+</button>
+                <button class="btn btn-ghost btn-sm" onclick="srDoZoomFit()" title="Fit to width">Fit</button>
+                <button class="btn btn-ghost btn-sm" onclick="srZoomOut()" title="Zoom out">−</button>
             </div>
 
-            <div class="sr-handles-bar" id="sr-handles-bar">
-                ${(function() {
-                    let html = '';
-                    for (let i = 0; i < d.page_count - 1; i++) {
-                        const idx = d.boundaries.indexOf(i + 1);
-                        const hasBorder = idx !== -1;
-                        const conf = hasBorder ? (d.confidences[idx] || 0) : 0;
-                        let colorClass = '';
-                        if (hasBorder) {
-                            colorClass = conf >= 0.7 ? 'sr-handle-high' : 'sr-handle-low';
-                        }
-                        html += `<div class="sr-handle-space">
-                            <div class="sr-handle ${hasBorder ? 'sr-handle-active ' + colorClass : ''}"
-                                 data-boundary="${i + 1}" onclick="srToggleHandle(this)">
-                            </div>
-                        </div>`;
-                    }
-                    return html;
-                })()}
-            </div>
-
-            <div class="sr-page-viewer">
+            <div class="sr-page-viewer" id="sr-page-viewer">
                 <button class="btn btn-ghost btn-sm" onclick="srPrevPage()">Prev</button>
-                <div class="sr-page-container">
-                    <img id="sr-page-img" src="${d.page_urls[0]}" alt="Page">
-                    <span id="sr-page-label">Page 1 of ${d.page_count}</span>
+                <div class="sr-page-scroll" id="sr-page-scroll">
+                    <img id="sr-page-img" src="${d.page_urls[0]}" alt="Page" style="max-width:none;">
                 </div>
                 <button class="btn btn-ghost btn-sm" onclick="srNextPage()">Next</button>
             </div>
+            <span id="sr-page-label">Page 1 of ${d.page_count}</span>
 
             <div class="sr-info" id="sr-split-info">
                 ${ch.map(c => {
@@ -3379,13 +3399,9 @@
         `;
 
         srCurrentPage = 0;
+        srZoomToFit = true;
+        srZoomLevel = 1;
         srOverlay.classList.add('open');
-
-        // Scroll page strip to show handles alignment
-        const strip = document.getElementById('sr-page-strip');
-        if (strip) {
-            strip.scrollLeft = 0;
-        }
         srShowPage(0);
     }
 
@@ -3398,19 +3414,60 @@
     }
 
     let srCurrentPage = 0;
+    let srZoomLevel = 1;
+    let srZoomToFit = true;
+
+    function srApplyZoom() {
+        const img = document.getElementById('sr-page-img');
+        const scroll = document.getElementById('sr-page-scroll');
+        if (!img || !scroll) return;
+        if (srZoomToFit) {
+            const w = scroll.clientWidth;
+            img.style.width = w + 'px';
+            img.style.height = 'auto';
+            img.style.maxWidth = 'none';
+        } else {
+            img.style.width = (100 * srZoomLevel) + '%';
+            img.style.height = 'auto';
+            img.style.maxWidth = 'none';
+        }
+    }
+
+    function srZoomIn() {
+        srZoomToFit = false;
+        srZoomLevel = Math.min(srZoomLevel + 0.25, 3);
+        srApplyZoom();
+    }
+
+    function srZoomOut() {
+        srZoomToFit = false;
+        srZoomLevel = Math.max(srZoomLevel - 0.25, 0.25);
+        srApplyZoom();
+    }
+
+    function srDoZoomFit() {
+        srZoomToFit = true;
+        srZoomLevel = 1;
+        srApplyZoom();
+    }
 
     function srShowPage(n) {
         const d = srReviewData;
         if (!d || n < 0 || n >= d.page_count) return;
         srCurrentPage = n;
         const img = document.getElementById('sr-page-img');
-        if (img) img.src = d.page_urls[n];
+        if (img) {
+            img.src = d.page_urls[n];
+            img.onload = () => srApplyZoom();
+        }
         const label = document.getElementById('sr-page-label');
         if (label) label.textContent = `Page ${n + 1} of ${d.page_count}`;
-        // Highlight active thumbnail
-        document.querySelectorAll('.sr-thumb').forEach((el, i) => {
+        document.querySelectorAll('.sr-thumb-wrapper').forEach((el, i) => {
             el.classList.toggle('sr-thumb-active', i === n);
         });
+        // Scroll page strip to show current page
+        const wrap = document.querySelector(`.sr-thumb-wrapper[data-page="${n}"]`);
+        if (wrap) wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
     }
 
     function srPrevPage() { if (srCurrentPage > 0) srShowPage(srCurrentPage - 1); }
@@ -3421,53 +3478,62 @@
     function srToggleHandle(el) {
         const boundary = parseInt(el.dataset.boundary);
         const idx = srReviewData.boundaries.indexOf(boundary);
-        const settingsConf = 0.7;
 
         if (idx !== -1) {
-            // Remove boundary
             srReviewData.boundaries.splice(idx, 1);
             srReviewData.confidences.splice(idx, 1);
         } else {
-            // Add boundary
             srReviewData.boundaries.push(boundary);
             srReviewData.confidences.push(0.5);
             srReviewData.boundaries.sort((a, b) => a - b);
             srReviewData.confidences = srReviewData.boundaries.map((b, i) => {
-                const existingConf = srReviewData.confidences[i];
-                return existingConf !== undefined ? existingConf : 0.5;
+                return i < srReviewData.confidences.length ? srReviewData.confidences[i] : 0.5;
             });
         }
-
-        // Update handles and child info
         refreshSrUI();
     }
 
     function refreshSrUI() {
         const d = srReviewData;
-        const conf = d.confidences;
         const boundaries = d.boundaries;
+        const confidences = d.confidences;
 
         // Update handles
         document.querySelectorAll('.sr-handle').forEach(el => {
             const b = parseInt(el.dataset.boundary);
             const idx = boundaries.indexOf(b);
             if (idx !== -1) {
-                const c = conf[idx] || 0;
+                const c = confidences[idx] || 0;
+                const pct = Math.round(c * 100);
+                const high = c >= 0.7;
                 el.classList.add('sr-handle-active');
-                el.classList.toggle('sr-handle-high', c >= 0.7);
-                el.classList.toggle('sr-handle-low', c < 0.7);
+                el.classList.toggle('sr-handle-high', high);
+                el.classList.toggle('sr-handle-low', !high);
+                el.querySelector('.sr-handle-label').textContent = pct + '%';
+                el.querySelector('.sr-handle-plus').style.display = 'none';
+                if (el.querySelector('.sr-handle-label')) {
+                    el.querySelector('.sr-handle-label').style.display = '';
+                }
+                el.title = 'Click to remove split at page ' + b + ' (' + pct + '% confidence)';
             } else {
                 el.classList.remove('sr-handle-active', 'sr-handle-high', 'sr-handle-low');
+                if (el.querySelector('.sr-handle-label')) {
+                    el.querySelector('.sr-handle-label').style.display = 'none';
+                }
+                if (el.querySelector('.sr-handle-plus')) {
+                    el.querySelector('.sr-handle-plus').style.display = '';
+                }
+                el.title = 'Click to add split after page ' + b;
             }
         });
 
         // Update child info
-        const start = 0;
         const sorted = [...boundaries].sort((a, b) => a - b);
         const children = [];
         let s = 0;
         for (const b of sorted) {
-            children.push({ start_page: s + 1, end_page: b, page_count: b - s, confidence: conf[sorted.indexOf(b)] || null });
+            const ci = boundaries.indexOf(b);
+            children.push({ start_page: s + 1, end_page: b, page_count: b - s, confidence: confidences[ci] || null });
             s = b;
         }
         children.push({ start_page: s + 1, end_page: d.page_count, page_count: d.page_count - s, confidence: null });
@@ -3504,7 +3570,6 @@
                 const data = await res.json();
                 showToast(`Split into ${data.child_count} documents (awaiting approval)`, 'success');
                 closeSplitReview();
-                // Hide split tab preview
                 const pDiv = document.getElementById('split-tab-preview');
                 if (pDiv) pDiv.classList.add('hidden');
                 document.getElementById('split-tab-result').innerHTML = '';
