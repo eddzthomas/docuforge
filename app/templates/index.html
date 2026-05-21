@@ -1661,7 +1661,10 @@
                             <div class="progress-track" data-od-id="split-progress-track">
                                 <div class="progress-fill split" id="split-tab-progress-bar" style="width: 0%" data-od-id="split-progress-bar"></div>
                             </div>
-                            <span style="font-size: 13px; color: var(--accent-interactive); margin-top: var(--space-2); display: block;" id="split-tab-phase-label" data-od-id="split-phase-label"></span>
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+                                <span style="font-size:13px;color:var(--accent-interactive);" id="split-tab-phase-label"></span>
+                                <button class="btn btn-ghost btn-sm" id="split-cancel-btn" onclick="cancelSplitDetection()" style="color:var(--danger);">Cancel</button>
+                            </div>
                         </div>
 
                         <div id="split-tab-preview" class="hidden mt-6" data-od-id="split-preview-container">
@@ -2258,6 +2261,8 @@
             } else if (!job._detailRow) {
                 job._detailRow = '';
             }
+
+            actionsHtml += ` <button class="btn btn-ghost btn-sm delete-job-btn" onclick="deleteJob('${job.id}')" title="Delete job">✕</button>`;
 
             let tierInfo = '';
             if (job.tier_summary && Object.keys(job.tier_summary).some(k => job.tier_summary[k] > 0)) {
@@ -3076,6 +3081,25 @@
         }
     }
 
+    let splitDetectionActive = false;
+
+    function cancelSplitDetection() {
+        splitDetectionActive = false;
+        const btn = document.getElementById('split-tab-detect-btn');
+        if (btn) { btn.disabled = false; btn.textContent = 'Detect Splits'; }
+        const progress = document.getElementById('split-tab-progress');
+        if (progress) progress.classList.add('hidden');
+        const jobId = document.getElementById('split-tab-job-select')?.value;
+        if (jobId) {
+            fetch(`/api/jobs/${jobId}/split-cache`, { method: 'DELETE' }).catch(() => {});
+            fetch(`/api/jobs/${jobId}/split-points`, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({boundaries: []}),
+            }).catch(() => {});
+        }
+        showToast('Split detection cancelled', 'info');
+    }
+
     async function executeTabDetect() {
         const jobId = document.getElementById('split-tab-job-select')?.value;
         if (!jobId) { showToast('Select a PDF first', 'error'); return; }
@@ -3089,6 +3113,7 @@
         if (progressDiv) progressDiv.classList.remove('hidden');
         if (previewDiv) previewDiv.classList.add('hidden');
         if (resultEl) resultEl.innerHTML = '';
+        splitDetectionActive = true;
 
         try {
             const res = await fetch(`/api/jobs/${jobId}/split-detect`, { method: 'POST' });
@@ -3124,6 +3149,7 @@
         };
 
         for (let i = 0; i < 300; i++) {
+            if (!splitDetectionActive) return;
             await new Promise(r => setTimeout(r, 1000));
             try {
                 const res = await fetch(`/api/jobs/${jobId}`);
@@ -3362,19 +3388,30 @@
 
             <div class="sr-page-strip" id="sr-page-strip">${stripHtml}</div>
 
-            <div class="sr-zoom-controls">
+            <div class="sr-view-toggle">
+                <button class="toggle-btn active" id="sr-toggle-pdf" onclick="srSwitchView('pdf')">PDF</button>
+                <button class="toggle-btn" id="sr-toggle-image" onclick="srSwitchView('image')">Image</button>
+            </div>
+
+            <div class="sr-zoom-controls" id="sr-zoom-controls" style="display:none;">
                 <button class="btn btn-ghost btn-sm" onclick="srZoomIn()" title="Zoom in">+</button>
                 <button class="btn btn-ghost btn-sm" onclick="srDoZoomFit()" title="Fit to width">Fit</button>
                 <button class="btn btn-ghost btn-sm" onclick="srZoomOut()" title="Zoom out">−</button>
             </div>
 
-            <div class="sr-page-viewer" id="sr-page-viewer">
+            <div class="sr-page-viewer" id="sr-page-viewer" style="display:none;">
                 <button class="btn btn-ghost btn-sm" onclick="srPrevPage()">Prev</button>
                 <div class="sr-page-scroll" id="sr-page-scroll">
                     <img id="sr-page-img" src="${d.page_urls[0]}" alt="Page" style="max-width:none;">
                 </div>
                 <button class="btn btn-ghost btn-sm" onclick="srNextPage()">Next</button>
             </div>
+
+            <div class="sr-page-viewer" id="sr-pdf-viewer">
+                <embed id="sr-pdf-embed" src="/api/jobs/${jobId}/source-pdf#page=1"
+                       type="application/pdf" class="sr-pdf-embed" style="min-height:55vh;">
+            </div>
+
             <span id="sr-page-label">Page 1 of ${d.page_count}</span>
 
             <div class="sr-info" id="sr-split-info">
@@ -3401,6 +3438,8 @@
         srCurrentPage = 0;
         srZoomToFit = true;
         srZoomLevel = 1;
+        srViewMode = 'pdf';
+        srReviewJobId = jobId;
         srOverlay.classList.add('open');
         srShowPage(0);
     }
@@ -3416,6 +3455,39 @@
     let srCurrentPage = 0;
     let srZoomLevel = 1;
     let srZoomToFit = true;
+    let srViewMode = 'pdf';
+    let srReviewJobId = null;
+
+    function srSwitchView(mode) {
+        srViewMode = mode;
+        const pdfViewer = document.getElementById('sr-pdf-viewer');
+        const imgViewer = document.getElementById('sr-page-viewer');
+        const zoomCtrls = document.getElementById('sr-zoom-controls');
+        const togglePdf = document.getElementById('sr-toggle-pdf');
+        const toggleImg = document.getElementById('sr-toggle-image');
+
+        if (mode === 'pdf') {
+            if (pdfViewer) pdfViewer.style.display = '';
+            if (imgViewer) imgViewer.style.display = 'none';
+            if (zoomCtrls) zoomCtrls.style.display = 'none';
+            if (togglePdf) togglePdf.classList.add('active');
+            if (toggleImg) toggleImg.classList.remove('active');
+            srSyncPdfPage();
+        } else {
+            if (pdfViewer) pdfViewer.style.display = 'none';
+            if (imgViewer) imgViewer.style.display = '';
+            if (zoomCtrls) zoomCtrls.style.display = '';
+            if (togglePdf) togglePdf.classList.remove('active');
+            if (toggleImg) toggleImg.classList.add('active');
+            srApplyZoom();
+        }
+    }
+
+    function srSyncPdfPage() {
+        const embed = document.getElementById('sr-pdf-embed');
+        if (!embed || !srReviewJobId) return;
+        embed.src = `/api/jobs/${srReviewJobId}/source-pdf#page=${srCurrentPage + 1}`;
+    }
 
     function srApplyZoom() {
         const img = document.getElementById('sr-page-img');
@@ -3458,14 +3530,14 @@
         const img = document.getElementById('sr-page-img');
         if (img) {
             img.src = d.page_urls[n];
-            img.onload = () => srApplyZoom();
+            img.onload = () => { if (srViewMode === 'image') srApplyZoom(); };
         }
+        if (srViewMode === 'pdf') srSyncPdfPage();
         const label = document.getElementById('sr-page-label');
         if (label) label.textContent = `Page ${n + 1} of ${d.page_count}`;
         document.querySelectorAll('.sr-thumb-wrapper').forEach((el, i) => {
             el.classList.toggle('sr-thumb-active', i === n);
         });
-        // Scroll page strip to show current page
         const wrap = document.querySelector(`.sr-thumb-wrapper[data-page="${n}"]`);
         if (wrap) wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
     }
@@ -3973,6 +4045,20 @@
         } catch (err) {
             showToast('Network error', 'error');
         }
+    }
+
+    async function deleteJob(jobId) {
+        if (!confirm('Delete this job? This cannot be undone.')) return;
+        try {
+            const res = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+            if (res.ok) {
+                showToast('Job deleted', 'info');
+                refreshJobs();
+            } else {
+                const err = await res.json();
+                showToast(err.detail || 'Delete failed', 'error');
+            }
+        } catch (err) { showToast('Network error', 'error'); }
     }
 
     function toggleDetail(detailId) {

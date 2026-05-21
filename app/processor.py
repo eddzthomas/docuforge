@@ -221,6 +221,19 @@ class JobManager:
                     if hasattr(job, key):
                         setattr(job, key, value)
 
+    def delete_job(self, job_id: str) -> bool:
+        """
+        Remove a job from the store. Thread-safe.
+
+        Returns:
+            True if the job was found and removed, False otherwise.
+        """
+        with self._lock:
+            if job_id in self._jobs:
+                del self._jobs[job_id]
+                return True
+            return False
+
 
 # ---- Singleton ----
 # One JobManager instance shared across the application

@@ -1068,6 +1068,64 @@ async def clear_split_cache(job_id: str):
     return JSONResponse({"cleaned": True})
 
 
+@app.get("/api/jobs/{job_id}/source-pdf")
+async def get_source_pdf(job_id: str):
+    """
+    Return the original uploaded PDF file as inline content.
+
+    Browsers can render it natively in an <embed> element.
+    Returns 404 if job not found, 400 if source is not a PDF.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    if not job.file_path:
+        raise HTTPException(status_code=404, detail="Job has no file path")
+
+    file_path = Path(job.file_path)
+    if file_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Source file is not a PDF")
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Source file not found on disk")
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{file_path.name}"'},
+    )
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """
+    Delete a job and optionally its source file from disk.
+
+    Clears the render cache and removes the job from the JobManager.
+    Returns 404 if the job does not exist.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    # Delete source file from disk if it exists
+    if job.file_path:
+        src = Path(job.file_path)
+        if src.exists():
+            src.unlink()
+
+    # Clear render cache
+    import shutil
+    render_cache = RENDER_CACHE_BASE / job_id
+    if render_cache.exists():
+        shutil.rmtree(str(render_cache))
+
+    job_manager.delete_job(job_id)
+
+    return JSONResponse({"deleted": job_id})
+
+
 @app.put("/api/jobs/{job_id}/split-points")
 async def adjust_split_points(job_id: str, body: dict):
     """
