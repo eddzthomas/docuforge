@@ -1203,6 +1203,7 @@ header p {
 
 .sr-pdf-embed {
     width: 100%;
+    height: 60vh;
     border: 1px solid var(--border-standard);
     border-radius: var(--radius-sm);
     background: #fff;

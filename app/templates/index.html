@@ -3419,7 +3419,7 @@
 
             <div class="sr-page-viewer" id="sr-pdf-viewer">
                 <embed id="sr-pdf-embed" src="/api/jobs/${jobId}/source-pdf#page=1"
-                       type="application/pdf" class="sr-pdf-embed" style="min-height:55vh;">
+                       type="application/pdf" class="sr-pdf-embed">
             </div>
 
             <span id="sr-page-label">Page 1 of ${d.page_count}</span>
@@ -3451,6 +3451,9 @@
         srViewMode = 'pdf';
         srReviewJobId = jobId;
         srOverlay.classList.add('open');
+        // Hide the table preview while the review modal is open
+        const previewDiv = document.getElementById('split-tab-preview');
+        if (previewDiv) previewDiv.classList.add('hidden');
         srShowPage(0);
     }
 
